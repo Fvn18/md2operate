@@ -1,0 +1,1081 @@
+#!/bin/sh
+# =============================================================================
+#  md2pdf —— Markdown → PDF 转换器 (macOS / POSIX sh)
+#
+#  依赖 : pandoc (必需) + xelatex | lualatex | tectonic | pdflatex (其一)
+#  可选 : fc-list(字体探测) qpdf(PDF 校验) fswatch(监听优化)
+#
+#  安装 : ./install.sh          # 软链到 ~/.local/bin，并写入 ~/.zshrc
+#  帮助 : md2pdf -h
+# =============================================================================
+set -u
+
+PROG=${0##*/}
+VERSION='1.0.0'
+NL='
+'
+
+# --------------------------------------------------------------- 路径解析 ----
+_resolve() {
+    _rp=$1
+    while [ -L "$_rp" ]; do
+        _rd=$(cd -P "$(dirname "$_rp")" >/dev/null 2>&1 && pwd) || return 1
+        _rp=$(readlink "$_rp")
+        case $_rp in /*) ;; *) _rp=$_rd/$_rp ;; esac
+    done
+    _rd=$(cd -P "$(dirname "$_rp")" >/dev/null 2>&1 && pwd) || return 1
+    printf '%s/%s\n' "$_rd" "${_rp##*/}"
+}
+SELF=$(_resolve "$0") || SELF=$0
+MD2PDF_HOME=${MD2PDF_HOME:-$(dirname "$SELF")}
+export MD2PDF_HOME
+
+# ------------------------------------------------------------------ 颜色 -----
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    C_R=$(printf '\033[31m'); C_G=$(printf '\033[32m'); C_Y=$(printf '\033[33m')
+    C_B=$(printf '\033[36m'); C_D=$(printf '\033[2m');  C_0=$(printf '\033[0m')
+else
+    C_R=; C_G=; C_Y=; C_B=; C_D=; C_0=
+fi
+
+QUIET=0; VERBOSE=0
+info() { [ "$QUIET" = 1 ] || printf '%s\n' "$*" >&2; }
+note() { [ "$QUIET" = 1 ] || printf '%s▸%s %s\n' "$C_B" "$C_0" "$*" >&2; }
+warn() { printf '%swarn:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+err()  { printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+dbg()  { [ "$VERBOSE" = 1 ] && printf '%sdebug:%s %s\n' "$C_D" "$C_0" "$*" >&2; return 0; }
+die()  { err "$1"; exit "${2:-1}"; }
+
+# --------------------------------------------------------------- 依赖检测 ----
+have() { command -v "$1" >/dev/null 2>&1; }
+
+hash_str() {
+    if   have md5;    then md5 -q
+    elif have md5sum; then md5sum | awk '{print $1}'
+    else cksum | awk '{print $1 "-" $2}'; fi
+}
+hash_file() { hash_str < "$1"; }
+
+# 是否含 CJK (UTF-8 前导字节 E4–E9)；检测不了则保守返回"有"
+has_cjk() {
+    [ -f "$1" ] || return 1
+    _pat=$(printf '[\344-\351]')
+    LC_ALL=C grep -q "$_pat" "$1" 2>/dev/null
+}
+
+font_exists() {
+    have fc-list || return 0
+    fc-list : family 2>/dev/null | tr ',' "$NL" \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | grep -Fxi -- "$1" >/dev/null 2>&1
+}
+
+pick_cjk_font() {
+    # macOS: PingFang SC 自 10.11 起为内置字体，由 CoreText 解析
+    # （fontconfig 往往看不到它，因此这里不做 fc-list 探测）
+    if [ "$(uname -s)" = Darwin ]; then
+        printf '%s\n' 'PingFang SC'
+        return 0
+    fi
+    for _f in "Noto Sans CJK SC" "Source Han Sans SC" "WenQuanYi Micro Hei" \
+              "Microsoft YaHei" "SimSun" "Songti SC"; do
+        font_exists "$_f" && { printf '%s\n' "$_f"; return 0; }
+    done
+    printf '%s\n' "Noto Sans CJK SC"
+}
+
+find_pandoc() {
+    have pandoc || die "未找到 pandoc。安装: brew install pandoc" 2
+    PANDOC=$(command -v pandoc)
+    PANDOC_VER=$("$PANDOC" --version 2>/dev/null | head -1 | awk '{print $2}')
+    [ -n "$PANDOC_VER" ] || PANDOC_VER='?'
+}
+
+engine_family() {
+    case $1 in
+        xelatex|lualatex|pdflatex|latex|tectonic|latexmk) echo latex ;;
+        wkhtmltopdf|weasyprint|prince)                    echo html  ;;
+        typst)                                            echo typst ;;
+        *)                                                echo other ;;
+    esac
+}
+
+pick_engine() {
+    if [ -n "$O_ENGINE" ]; then printf '%s\n' "$O_ENGINE"; return; fi
+    if [ -n "${MD2PDF_ENGINE:-}" ]; then printf '%s\n' "$MD2PDF_ENGINE"; return; fi
+    if [ "$TO" = pdf ]; then
+        for _e in xelatex lualatex tectonic pdflatex; do
+            have "$_e" && { printf '%s\n' "$_e"; return; }
+        done
+        die "未找到 PDF 引擎。安装: brew install --cask mactex-no-gui  或  brew install tectonic" 2
+    fi
+    printf '%s\n' xelatex
+}
+
+# --------------------------------------------------------------- 质量档位 ----
+preset_load() {
+    P_INCLUDE=''
+    case $1 in
+    draft|fast|q0)
+        P_DESC='极速草稿'
+        P_FONTSIZE=10pt; P_MARGIN=0.8in; P_LINESTRETCH=1.0; P_TOC=0; P_TOCDEPTH=2
+        P_NUMBERS=0; P_COLORLINKS=0; P_DOCCLASS=article; P_CLASSON=''
+        P_HIGHLIGHT=kate; P_GEOM_EXTRA='' ;;
+    std|standard|normal|q1)
+        P_DESC='标准(默认)'
+        P_FONTSIZE=11pt; P_MARGIN=1.2in; P_LINESTRETCH=''; P_TOC=0; P_TOCDEPTH=2
+        P_NUMBERS=1; P_COLORLINKS=0; P_DOCCLASS=article; P_CLASSON=''
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA='' ;;
+    high|hq|q2)
+        P_DESC='高质量论文'
+        P_FONTSIZE=11pt; P_MARGIN=1.0in; P_LINESTRETCH=1.25; P_TOC=1; P_TOCDEPTH=3
+        P_NUMBERS=1; P_COLORLINKS=1; P_DOCCLASS=article; P_CLASSON=''
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA='headheight=15pt' ;;
+    press|print|q3)
+        P_DESC='印刷排版(双面)'
+        P_FONTSIZE=12pt; P_MARGIN=1.0in; P_LINESTRETCH=1.3; P_TOC=1; P_TOCDEPTH=2
+        P_NUMBERS=1; P_COLORLINKS=2; P_DOCCLASS=article; P_CLASSON=twoside
+        P_HIGHLIGHT=tango
+        P_GEOM_EXTRA='bindingoffset=0.2in,headheight=16pt'
+        [ -f "$MD2PDF_HOME/includes/press.tex" ] && P_INCLUDE="$MD2PDF_HOME/includes/press.tex" ;;
+    cn|paper|thesis|q4)
+        P_DESC='中文论文 (ctex)'
+        P_FONTSIZE=''; P_MARGIN=1.1in; P_LINESTRETCH=''; P_TOC=1; P_TOCDEPTH=2
+        P_NUMBERS=1; P_COLORLINKS=1; P_DOCCLASS=ctexart; P_CLASSON='zihao=-4'
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA='' ;;
+    screen|web|ebook|q5)
+        P_DESC='屏幕阅读'
+        P_FONTSIZE=11pt; P_MARGIN=0.9in; P_LINESTRETCH=1.35; P_TOC=1; P_TOCDEPTH=3
+        P_NUMBERS=1; P_COLORLINKS=1; P_DOCCLASS=article; P_CLASSON=''
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA='' ;;
+    slides|beamer|q6)
+        P_DESC='Beamer 幻灯片'
+        P_FONTSIZE=''; P_MARGIN=''; P_LINESTRETCH=''; P_TOC=0; P_TOCDEPTH=2
+        P_NUMBERS=0; P_COLORLINKS=1; P_DOCCLASS=beamer; P_CLASSON=''
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA='' ;;
+    *) die "未知质量档位: $1  (可用: $(preset_names | tr '\n' ' '))" 1 ;;
+    esac
+}
+
+preset_names() { printf 'draft\nstd\nhigh\npress\ncn\nscreen\nslides\n'; }
+
+preset_aliases() {
+    case $1 in
+    draft)  printf 'fast q0' ;;
+    std)    printf 'standard normal q1' ;;
+    high)   printf 'hq q2' ;;
+    press)  printf 'print q3' ;;
+    cn)     printf 'paper thesis q4' ;;
+    screen) printf 'web ebook q5' ;;
+    slides) printf 'beamer q6' ;;
+    esac
+}
+
+json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+cmd_list() {
+    # ---- JSON 输出：供网页工作台 / mdp CLI / 脚本消费，是档位的唯一事实来源 ----
+    if [ "${JSON_OUT:-0}" = 1 ]; then
+        printf '{"version":"%s","defaultQuality":"%s","engine":"%s","pandoc":"%s","rasterizer":"%s","targets":["pdf","png","html","docx","tex","epub","pptx"],"presets":[' \
+            "$(json_esc "$VERSION")" "$(json_esc "${MD2PDF_QUALITY:-std}")" \
+            "$(json_esc "$(pick_engine)")" "$(json_esc "$PANDOC_VER")" "$(pick_raster_tool)"
+        _first=1
+        for p in $(preset_names); do
+            preset_load "$p"
+            [ "$_first" = 1 ] || printf ','
+            _first=0
+            printf '{"id":"%s","aliases":"%s","desc":"%s","fontsize":"%s","margin":"%s","linestretch":"%s","toc":%s,"tocDepth":%s,"numbers":%s,"colorlinks":%s,"documentclass":"%s","classoption":"%s","highlight":"%s","geomExtra":"%s","include":"%s","beamer":%s}' \
+                "$p" "$(preset_aliases "$p")" "$(json_esc "$P_DESC")" \
+                "$(json_esc "$P_FONTSIZE")" "$(json_esc "$P_MARGIN")" "$(json_esc "$P_LINESTRETCH")" \
+                "$([ "$P_TOC" = 1 ] && echo true || echo false)" "$P_TOCDEPTH" \
+                "$([ "$P_NUMBERS" = 1 ] && echo true || echo false)" "${P_COLORLINKS:-0}" \
+                "$(json_esc "$P_DOCCLASS")" "$(json_esc "$P_CLASSON")" "$(json_esc "$P_HIGHLIGHT")" \
+                "$(json_esc "$P_GEOM_EXTRA")" "$(json_esc "$P_INCLUDE")" \
+                "$([ "$P_DOCCLASS" = beamer ] && echo true || echo false)"
+        done
+        printf '],"engines":['
+        _first=1
+        for _e in xelatex lualatex tectonic pdflatex weasyprint wkhtmltopdf typst; do
+            if have "$_e"; then
+                [ "$_first" = 1 ] || printf ','
+                _first=0
+                printf '"%s"' "$_e"
+            fi
+        done
+        printf ']}\n'
+        exit 0
+    fi
+
+    printf '\n%s质量档位%s   (引擎 %s%s%s · pandoc %s)\n\n' "$C_B" "$C_0" "$C_G" "$(pick_engine)" "$C_0" "$PANDOC_VER"
+    printf '  %-8s %-7s %-8s %-5s %-5s %-11s %s\n' 档位 字号 页边距 TOC NUM STYLE 说明
+    printf '  %s\n' '----------------------------------------------------------------------------'
+    for p in $(preset_names); do
+        preset_load "$p"
+        printf '  %-8s %-7s %-8s %-5s %-5s %-11s %s\n' \
+            "$p" "${P_FONTSIZE:--}" "${P_MARGIN:--}" \
+            "$([ "$P_TOC" = 1 ] && echo Y || echo -)" \
+            "$([ "$P_NUMBERS" = 1 ] && echo Y || echo -)" \
+            "$P_HIGHLIGHT" "$P_DESC"
+    done
+    printf '\n  %sTOC=目录  NUM=章节编号  STYLE=代码高亮%s\n' "$C_D" "$C_0"
+    printf '  %s输出目标%s  pdf(默认) · png(--dpi 300 高清位图) · tex · html · docx\n' "$C_D" "$C_0"
+    printf '  %s栅格化%s    %s\n' "$C_D" "$C_0" "$(pick_raster_tool)"
+    printf '  %s示例%s  md2pdf -q high 论文.md      md2pdf -t png --dpi 300 图.md\n' "$C_D" "$C_0"
+    printf '  %s网页%s  md2pdf serve\n\n' "$C_D" "$C_0"
+    exit 0
+}
+
+# ------------------------------------------------------------------ 帮助 -----
+cmd_help() {
+    cat <<EOF
+
+${C_B}md2pdf $VERSION${C_0} —— Markdown → PDF 转换器 (macOS)
+
+${C_B}用法${C_0}
+  md2pdf [选项] 文件.md [更多.md ...]
+  md2pdf doctor [--selftest]     环境体检 / 自检
+  md2pdf list                    查看质量档位
+  md2pdf init-config             生成用户配置模板
+  md2pdf --clean                 清理转换缓存
+  md2pdf serve [--port 8757]     启动网页工作台 MDP Studio（需要 node ≥ 20）
+
+${C_B}质量档位 -q LEVEL${C_0}
+  draft   极速草稿  10pt/0.8in/无目录无编号/kate       (约 2 倍速)
+  std     标准(默认) 11pt/1.2in/无目录/章节编号/tango  (等价常用命令)
+  high    高质量    11pt/1.0in/目录/1.25 行距/彩色链接
+  press   印刷排版  双面/12pt/页眉页脚/黑色链接
+  cn      中文论文  ctexart + fontset=macnew (宋体/黑体/楷体)
+  screen  屏幕阅读  1.35 行距/彩色链接/三级目录
+  slides  Beamer 幻灯片
+
+${C_B}常用选项${C_0}
+  -q, --quality LEVEL   质量档位 (默认 std)
+  -e, --engine NAME     xelatex|lualatex|tectonic|pdflatex|wkhtmltopdf|weasyprint|typst
+  -o, --output FILE     输出文件 (默认与原文件同目录)
+  -d, --outdir DIR      输出目录
+  -t, --to FORMAT       pdf|png|html|docx|tex|epub|pptx (默认 pdf)
+                        png = 先按 LaTeX 排版成 PDF，再栅格化成位图
+      --dpi N           PNG 目标分辨率，默认 200 (150 屏幕 / 300 打印 / 600 印刷)
+      --page N          PNG 取第几页，默认 1
+      --png-transparent PNG 透明背景（需 poppler 或 ghostscript；sips 回退不支持）
+      --keep-pdf        产出 PNG 时保留中间 PDF，便于对照与再加工
+      --json            list / doctor 以 JSON 输出（供脚本与网页端消费）
+  -f, --force           忽略缓存强制重建
+  -n, --dry-run         只打印 pandoc 命令，不执行
+  -k, --keep-tex        保留中间 .tex 便于排错
+  -O, --open            完成后用默认程序打开
+  -w, --watch           监听源文件，改动即重建
+  -j, --jobs N          并行转换 N 个文件 (默认 1)
+  -s, --var KEY=VAL     追加 pandoc 变量 (-V)，可重复
+  -M, --metadata K=VAL  追加元数据 (-M)，可重复
+
+      --toc / --no-toc             目录开关
+      --toc-depth N                目录深度 (默认 2)
+      --toc-title T                目录标题
+      --numbers / --no-numbers     章节编号开关
+      --fontsize 11pt              正文字号
+      --margin 1.2in               页边距
+      --linestretch 1.25           行距倍数
+      --mainfont F / --cjkfont F / --monofont F
+      --cjk auto|on|off            中文字体处理 (默认 auto 按内容探测)
+      --highlight STYLE            代码高亮 tango/kate/pygments/breezeDark...
+      --colorlinks / --no-colorlinks
+      --documentclass article|ctexart|report|book
+      --classoption twoside        文档类选项，可重复
+      --lang zh|en                 目录等本地化
+      --template FILE              pandoc 模板
+  -H, --include-in-header F        追加 LaTeX 头部片段，可重复
+      --css FILE                   HTML 输出样式
+      --bibliography F --csl F --citeproc
+      --metadata-file F --resource-path P
+      --pdf-engine-opt OPT         透传给 PDF 引擎
+      --                           其余参数原样交给 pandoc
+
+      --config FILE                指定配置文件
+      --quiet / --verbose
+  -h, --help  /  --version
+
+${C_B}示例${C_0}
+  md2pdf 黎曼勒贝格定理.md                 # 标准质量（等价你原来的命令）
+  md2pdf -q high --toc 论文.md             # 高质量 + 目录
+  md2pdf -q cn -o 论文.pdf 论文.md         # 中文论文排版
+  md2pdf -q draft -w 笔记.md               # 边写边看
+  md2pdf -j 4 -q high *.md                 # 批量并行
+  md2pdf -t png --dpi 300 -q high 图.md    # 高清 PNG（300dpi）
+  md2pdf serve                             # 打开网页工作台 MDP Studio
+  md2pdf list --json                       # 档位表（JSON，供脚本消费）
+  md2pdf -n 论文.md                        # 只看真实执行的命令
+
+${C_B}配置${C_0}
+  文件    ${XDG_CONFIG_HOME:-$HOME/.config}/md2pdf/config.sh
+  变量    MD2PDF_QUALITY MD2PDF_ENGINE MD2PDF_MAIN_FONT MD2PDF_CJK_FONT
+          MD2PDF_MONO_FONT MD2PDF_MARGIN MD2PDF_FONTSIZE MD2PDF_JOBS
+          MD2PDF_EXTRA_ARGS
+  缓存    ${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf   (源文件与参数未变则跳过)
+EOF
+    exit 0
+}
+
+# ------------------------------------------------------------ 配置模板 -------
+cmd_init_config() {
+    _dir=${XDG_CONFIG_HOME:-$HOME/.config}/md2pdf
+    _file=$_dir/config.sh
+    mkdir -p "$_dir" || die "无法创建 $_dir"
+    [ -f "$_file" ] && [ "$FORCE" != 1 ] && die "已存在: $_file  (加 -f 覆盖)"
+    cat > "$_file" <<'EOF'
+# ~/.config/md2pdf/config.sh —— md2pdf 用户配置(就是 shell，可直接写逻辑)
+MD2PDF_QUALITY=std              # 默认档位: draft std high press cn screen slides
+MD2PDF_ENGINE=xelatex           # xelatex | lualatex | tectonic
+MD2PDF_MAIN_FONT="Times New Roman"
+MD2PDF_CJK_FONT=auto            # auto 自动探测，或写死 "PingFang SC"
+MD2PDF_MONO_FONT="Menlo"
+MD2PDF_JOBS=1                   # 批量并行数
+# MD2PDF_MARGIN=1.2in
+# MD2PDF_FONTSIZE=11pt
+# MD2PDF_WATCH_INTERVAL=1
+# 追加给所有任务的 pandoc 参数(每行一个):
+# MD2PDF_EXTRA_ARGS="--citeproc
+# --bibliography=$HOME/refs.bib"
+EOF
+    info "${C_G}已生成${C_0} $_file"
+    exit 0
+}
+
+# ------------------------------------------------------------------ 体检 -----
+cmd_doctor() {
+    find_pandoc
+    printf '\n%s环境体检%s\n' "$C_B" "$C_0"
+    printf '  %-13s %s%s%s  %s\n' pandoc "$C_G" "$PANDOC_VER" "$C_0" "$PANDOC"
+    for e in xelatex lualatex pdflatex tectonic latexmk wkhtmltopdf weasyprint typst; do
+        if have "$e"; then
+            printf '  %-13s %s✓%s %s\n' "$e" "$C_G" "$C_0" \
+                "$("$e" --version 2>/dev/null | head -1 | cut -c1-52)"
+        else
+            printf '  %-13s %s—%s\n' "$e" "$C_D" "$C_0"
+        fi
+    done
+    printf '  %-13s ' fc-list
+    if have fc-list; then printf '%s✓%s\n' "$C_G" "$C_0"; else printf '%s— (字体探测降级)%s\n' "$C_D" "$C_0"; fi
+    for t in qpdf fswatch; do
+        printf '  %-13s ' "$t"
+        if have "$t"; then printf '%s✓%s\n' "$C_G" "$C_0"; else printf '%s— (可选)%s\n' "$C_D" "$C_0"; fi
+    done
+    printf '  %-13s main=%s  cjk=%s  mono=%s\n' 字体 \
+        "${O_MAIN_FONT:-${MD2PDF_MAIN_FONT:-Times New Roman}}" "$(pick_cjk_font)" \
+        "${O_MONO_FONT:-${MD2PDF_MONO_FONT:-Menlo}}"
+    printf '  %-13s ' ctex
+    if kpsewhich ctex.sty >/dev/null 2>&1; then printf '%s✓ (-q cn 可用)%s\n' "$C_G" "$C_0"
+    else printf '%s✗ (-q cn 不可用)%s\n' "$C_Y" "$C_0"; fi
+    printf '  %-13s %s\n' 配置文件 "${CONF_FILES:-<无>}"
+    printf '  %-13s %s\n' 缓存 "${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf"
+    printf '  %-13s %s\n' 脚本目录 "$MD2PDF_HOME"
+
+    if [ "$SELFTEST" = 1 ]; then
+        printf '\n%s自检%s' "$C_B" "$C_0"
+        _tmp=$(mktemp -d "${TMPDIR:-/tmp}/md2pdf-self.XXXXXX")
+        cat > "$_tmp/t.md" <<'EOF'
+---
+title: 自检 Self Test
+---
+
+# 标题 Heading
+
+中文与 English 混排 $E=mc^2$。
+
+```sh
+echo ok
+```
+
+| A | B |
+|---|---|
+| 1 | 2 |
+EOF
+        for q in draft std cn; do
+            printf '\n  [%-5s] ' "$q"
+            _t0=$(date +%s)
+            if ( cd "$_tmp" && "$SELF" -q "$q" -f -o "$_tmp/$q.pdf" "$_tmp/t.md" \
+                    >/dev/null 2>"$_tmp/$q.err" ); then
+                _t1=$(date +%s)
+                printf '%s✓%s  %ss  %s KB' "$C_G" "$C_0" "$((_t1 - _t0))" \
+                    "$(( $(wc -c < "$_tmp/$q.pdf" | tr -d ' ') / 1024 ))"
+            else
+                printf '%s✗%s' "$C_R" "$C_0"
+                tail -6 "$_tmp/$q.err" | sed 's/^/       /'
+            fi
+        done
+        printf '\n'
+        rm -rf "$_tmp"
+    fi
+    printf '\n'
+    exit 0
+}
+
+# ------------------------------------------------------------ 参数解析 -------
+add_arg()      { USER_ARGS="${USER_ARGS}${USER_ARGS:+$NL}$1"; }
+
+usage_err() { err "$1"; printf '  用法: %s [选项] 文件.md ...   (帮助: %s -h)\n' "$PROG" "$PROG" >&2; exit 1; }
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -h|--help)        cmd_help ;;
+        --version)        printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        doctor|--doctor)  DOCTOR=1; shift ;;
+        list|--list)      LIST_ARGS=1; shift ;;
+        init-config)      INITCFG=1; shift ;;
+        --selftest)       SELFTEST=1; shift ;;
+        -q|--quality)     [ $# -ge 2 ] || usage_err "$1 需要参数"; QUALITY=$2; shift 2 ;;
+        -q*)              QUALITY=${1#-q}; shift ;;
+        -e|--engine)      [ $# -ge 2 ] || usage_err "$1 需要参数"; O_ENGINE=$2; shift 2 ;;
+        -o|--output)      [ $# -ge 2 ] || usage_err "$1 需要参数"; OUTPUT=$2; shift 2 ;;
+        -d|--outdir)      [ $# -ge 2 ] || usage_err "$1 需要参数"; OUTDIR=$2; shift 2 ;;
+        -t|--to)          [ $# -ge 2 ] || usage_err "$1 需要参数"; TO=$2; shift 2 ;;
+        --dpi)            [ $# -ge 2 ] || usage_err "$1 需要参数"; PNG_DPI=$2; shift 2 ;;
+        --dpi=*)          PNG_DPI=${1#*=}; shift ;;
+        --page)           [ $# -ge 2 ] || usage_err "$1 需要参数"; PNG_PAGE=$2; shift 2 ;;
+        --page=*)         PNG_PAGE=${1#*=}; shift ;;
+        --png-transparent|--transparent) PNG_TRANSPARENT=1; shift ;;
+        --keep-pdf)       PNG_KEEP_PDF=1; shift ;;
+        --json)           JSON_OUT=1; shift ;;
+        -f|--force)       FORCE=1; shift ;;
+        -n|--dry-run)     DRY=1; shift ;;
+        -k|--keep-tex)    KEEP_TEX=1; shift ;;
+        -O|--open)        OPEN_AFTER=1; shift ;;
+        -w|--watch)       WATCH=1; shift ;;
+        -j|--jobs)        [ $# -ge 2 ] || usage_err "$1 需要参数"; JOBS=$2; shift 2 ;;
+        -s|--var)         [ $# -ge 2 ] || usage_err "$1 需要参数"; add_arg -V; add_arg "$2"; shift 2 ;;
+        -M|--metadata)    [ $# -ge 2 ] || usage_err "$1 需要参数"; add_arg -M; add_arg "$2"; shift 2 ;;
+        --toc)            O_TOC=1; shift ;;
+        --no-toc)         O_TOC=0; shift ;;
+        --toc-depth)      [ $# -ge 2 ] || usage_err "$1 需要参数"; O_TOCDEPTH=$2; shift 2 ;;
+        --toc-title)      [ $# -ge 2 ] || usage_err "$1 需要参数"; O_TOC_TITLE=$2; shift 2 ;;
+        --numbers)        O_NUMBERS=1; shift ;;
+        --no-numbers)     O_NUMBERS=0; shift ;;
+        --fontsize)       [ $# -ge 2 ] || usage_err "$1 需要参数"; O_FONTSIZE=$2; shift 2 ;;
+        --margin)         [ $# -ge 2 ] || usage_err "$1 需要参数"; O_MARGIN=$2; shift 2 ;;
+        --linestretch)    [ $# -ge 2 ] || usage_err "$1 需要参数"; O_LINESTRETCH=$2; shift 2 ;;
+        --mainfont)       [ $# -ge 2 ] || usage_err "$1 需要参数"; O_MAIN_FONT=$2; shift 2 ;;
+        --cjkfont)        [ $# -ge 2 ] || usage_err "$1 需要参数"; O_CJK_FONT=$2; shift 2 ;;
+        --monofont)       [ $# -ge 2 ] || usage_err "$1 需要参数"; O_MONO_FONT=$2; shift 2 ;;
+        --cjk)            [ $# -ge 2 ] || usage_err "$1 需要参数"; CJK_MODE=$2; shift 2 ;;
+        --highlight|--highlight-style|--syntax-highlighting)
+                          [ $# -ge 2 ] || usage_err "$1 需要参数"; O_HIGHLIGHT=$2; shift 2 ;;
+        --highlight=*|--highlight-style=*|--syntax-highlighting=*)
+                          O_HIGHLIGHT=${1#*=}; shift ;;
+        --colorlinks)     O_COLORLINKS=1; shift ;;
+        --no-colorlinks)  O_COLORLINKS=0; shift ;;
+        --documentclass)  [ $# -ge 2 ] || usage_err "$1 需要参数"; O_DOCCLASS=$2; shift 2 ;;
+        --classoption)    [ $# -ge 2 ] || usage_err "$1 需要参数"; O_CLASSON="${O_CLASSON}${O_CLASSON:+$NL}$2"; shift 2 ;;
+        --lang)           [ $# -ge 2 ] || usage_err "$1 需要参数"; O_LANG=$2; shift 2 ;;
+        --template)       [ $# -ge 2 ] || usage_err "$1 需要参数"; O_TEMPLATE=$2; shift 2 ;;
+        -H|--include-in-header)
+                          [ $# -ge 2 ] || usage_err "$1 需要参数"; O_INCLUDE="${O_INCLUDE}${O_INCLUDE:+$NL}$2"; shift 2 ;;
+        --css)            [ $# -ge 2 ] || usage_err "$1 需要参数"; O_CSS="${O_CSS}${O_CSS:+$NL}$2"; shift 2 ;;
+        --bibliography)   [ $# -ge 2 ] || usage_err "$1 需要参数"; O_BIB=$2; shift 2 ;;
+        --csl)            [ $# -ge 2 ] || usage_err "$1 需要参数"; O_CSL=$2; shift 2 ;;
+        --citeproc)       add_arg --citeproc; shift ;;
+        --metadata-file)  [ $# -ge 2 ] || usage_err "$1 需要参数"; O_METADATA_FILE=$2; shift 2 ;;
+        --resource-path)  [ $# -ge 2 ] || usage_err "$1 需要参数"; O_RESOURCE_PATH=$2; shift 2 ;;
+        --pdf-engine-opt) [ $# -ge 2 ] || usage_err "$1 需要参数"; add_arg --pdf-engine-opt; add_arg "$2"; shift 2 ;;
+        --pdf-engine-opt=*) add_arg "$1"; shift ;;
+        --lua-filter|--filter)
+                          [ $# -ge 2 ] || usage_err "$1 需要参数"; add_arg "$1"; add_arg "$2"; shift 2 ;;
+        --config)         [ $# -ge 2 ] || usage_err "$1 需要参数"; shift 2 ;;   # 已提前加载
+        --quiet)          QUIET=1; shift ;;
+        --verbose)        VERBOSE=1; shift ;;
+        --clean)          _cd=${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf
+                          rm -rf "$_cd"; info "已清理缓存 $_cd"; exit 0 ;;
+        --no-cjk)         CJK_MODE=off; shift ;;
+        --)               shift; while [ $# -gt 0 ]; do add_arg "$1"; shift; done ;;
+        -?*)              usage_err "未知选项: $1" ;;
+        *)                FILES="${FILES:-}${FILES:+$NL}$1"; shift ;;
+        esac
+    done
+}
+
+# -------------------------------------------------------------- 参数装配 -----
+finalize() {
+    preset_load "$QUALITY"
+    FONTSIZE=$P_FONTSIZE; MARGIN=$P_MARGIN; LINESTRETCH=$P_LINESTRETCH
+    TOC=$P_TOC; TOCDEPTH=$P_TOCDEPTH; NUMBERS=$P_NUMBERS; COLORLINKS=$P_COLORLINKS
+    DOCCLASS=$P_DOCCLASS; CLASSON=$P_CLASSON; HIGHLIGHT=$P_HIGHLIGHT
+    GEOM_EXTRA=$P_GEOM_EXTRA; INCLUDE=$P_INCLUDE
+
+    [ -n "$O_FONTSIZE" ]    && FONTSIZE=$O_FONTSIZE
+    [ -n "$O_MARGIN" ]      && MARGIN=$O_MARGIN
+    [ -n "$O_LINESTRETCH" ] && LINESTRETCH=$O_LINESTRETCH
+    [ -n "$O_TOC" ]         && TOC=$O_TOC
+    [ -n "$O_TOCDEPTH" ]    && TOCDEPTH=$O_TOCDEPTH
+    [ -n "$O_NUMBERS" ]     && NUMBERS=$O_NUMBERS
+    [ -n "$O_COLORLINKS" ]  && COLORLINKS=$O_COLORLINKS
+    [ -n "$O_DOCCLASS" ]    && DOCCLASS=$O_DOCCLASS
+    [ -n "$O_HIGHLIGHT" ]   && HIGHLIGHT=$O_HIGHLIGHT
+    [ -n "$O_CLASSON" ]     && CLASSON="${CLASSON}${CLASSON:+$NL}$O_CLASSON"
+
+    [ -n "${MD2PDF_FONTSIZE:-}" ] && [ -z "$O_FONTSIZE" ] && FONTSIZE=$MD2PDF_FONTSIZE
+    [ -n "${MD2PDF_MARGIN:-}" ]   && [ -z "$O_MARGIN" ]   && MARGIN=$MD2PDF_MARGIN
+    [ -n "${MD2PDF_EXTRA_ARGS:-}" ] && USER_ARGS="${USER_ARGS}${USER_ARGS:+$NL}$MD2PDF_EXTRA_ARGS"
+
+    MAIN_FONT=${O_MAIN_FONT:-${MD2PDF_MAIN_FONT:-'Times New Roman'}}
+    MONO_FONT=${O_MONO_FONT:-${MD2PDF_MONO_FONT:-Menlo}}
+    CJK_FONT=${O_CJK_FONT:-${MD2PDF_CJK_FONT:-auto}}
+
+    ENGINE=$(pick_engine)
+    FAMILY=$(engine_family "$ENGINE")
+    [ "$DOCCLASS" = beamer ] && TO=beamer
+    [ "$TO" = beamer ] && FAMILY=latex
+
+    # ---- PNG 目标：内部先排版成 PDF，再栅格化 ----------------------------
+    # 保持 TO 为「真实的 pandoc 目标」，另用 PNG_MODE 表示最终产物是位图；
+    # out_for/ext_for 会据此把输出名写成 .png，而 build_ext 仍用 .pdf 建中间件。
+    case $TO in
+    png|PNG)
+        PNG_MODE=1
+        if [ "$DOCCLASS" = beamer ]; then TO=beamer; FAMILY=latex; else TO=pdf; fi
+        case $PNG_DPI in ''|*[!0-9]*) PNG_DPI=200 ;; esac
+        case $PNG_PAGE in ''|*[!0-9]*) PNG_PAGE=1 ;; esac
+        [ "$PNG_DPI" -lt 36 ] && PNG_DPI=36
+        [ "$PNG_DPI" -gt 1200 ] && PNG_DPI=1200
+        [ "$PNG_PAGE" -lt 1 ] && PNG_PAGE=1
+        ;;
+    esac
+}
+
+# 中文字体 / CJK 变量是否启用；$1 = 源文件
+resolve_fonts() {
+    _src=$1
+    CJK_ON=0
+    case $CJK_MODE in
+        on)  CJK_ON=1 ;;
+        off) CJK_ON=0 ;;
+        *)   case $TO in
+                 pdf|tex|beamer) [ -n "$_src" ] && [ -f "$_src" ] && has_cjk "$_src" && CJK_ON=1 ;;
+             esac ;;
+    esac
+    case $DOCCLASS in
+        ctex*) USE_CJK_VAR=0 ;;        # ctex 自行管理中文
+        *)     USE_CJK_VAR=$CJK_ON ;;
+    esac
+    if [ "$CJK_FONT" = auto ] || [ -z "$CJK_FONT" ]; then
+        RESOLVED_CJK=$(pick_cjk_font)
+    else
+        RESOLVED_CJK=$CJK_FONT
+    fi
+}
+
+append_lines() {   # $1 = 多行字符串 → 追加到位置参数
+    _oldifs=$IFS; IFS=$NL
+    for _x in $1; do [ -n "$_x" ] && set -- "$@" "$_x"; done
+    IFS=$_oldifs
+}
+
+# ------------------------------------------------------------ 构造 pandoc ---
+# pandoc 的 writer 名（没有 `tex` 这个 writer，必须映射为 latex）
+writer_for() {
+    case $TO in
+        pdf)    case $FAMILY in
+                    html)  echo html  ;;
+                    typst) echo typst ;;
+                    *)     echo latex ;;
+                esac ;;
+        beamer) echo beamer ;;
+        tex)    echo latex  ;;
+        *)      echo "$TO"   ;;
+    esac
+}
+
+build_and_run() {
+    _bin=$1; _bout=$2
+    set -- "$_bin" -o "$_bout" -t "$(writer_for)"
+
+    case $TO in
+        pdf|beamer) set -- "$@" --pdf-engine="$ENGINE" ;;
+    esac
+
+    case $FAMILY in
+    latex)
+        set -- "$@" --standalone
+        [ "$TO" = beamer ] && set -- "$@" --slide-level="${MD2PDF_SLIDE_LEVEL:-2}"
+        [ -n "$DOCCLASS" ] && set -- "$@" -V "documentclass=$DOCCLASS"
+        _oldifs=$IFS; IFS=$NL
+        for _co in $CLASSON; do [ -n "$_co" ] && set -- "$@" -V "classoption=$_co"; done
+        IFS=$_oldifs
+        if [ -n "$MARGIN" ]; then
+            _geo="a4paper,margin=$MARGIN"
+            [ -n "$GEOM_EXTRA" ] && _geo="$_geo,$GEOM_EXTRA"
+            set -- "$@" -V "geometry=$_geo"
+        fi
+        [ -n "$FONTSIZE" ] && set -- "$@" -V "fontsize=$FONTSIZE"
+        [ -n "$MAIN_FONT" ] && set -- "$@" -V "mainfont=$MAIN_FONT"
+        [ -n "$MONO_FONT" ] && set -- "$@" -V "monofont=$MONO_FONT"
+        [ "$USE_CJK_VAR" = 1 ] && [ -n "$RESOLVED_CJK" ] && set -- "$@" -V "CJKmainfont=$RESOLVED_CJK"
+        [ -n "$LINESTRETCH" ] && set -- "$@" -V "linestretch=$LINESTRETCH"
+        [ -n "$HIGHLIGHT" ] && set -- "$@" --highlight-style="$HIGHLIGHT"
+        if [ "$COLORLINKS" != 0 ]; then
+            set -- "$@" -V colorlinks=true
+            if [ "$COLORLINKS" = 2 ]; then
+                set -- "$@" -V linkcolor=black -V urlcolor=black -V toccolor=black -V citecolor=black
+            else
+                set -- "$@" -V linkcolor=RoyalBlue -V urlcolor=RoyalBlue -V toccolor=black
+            fi
+        fi
+        [ "$TOC" = 1 ] && set -- "$@" --toc --toc-depth="$TOCDEPTH"
+        [ "$NUMBERS" = 1 ] && set -- "$@" --number-sections
+        if [ "$TOC" = 1 ]; then
+            _tt=$O_TOC_TITLE
+            if [ -z "$_tt" ]; then
+                case ${O_LANG:-auto} in
+                    zh) _tt=目录 ;;
+                    en) _tt=Contents ;;
+                    *)  [ "$CJK_ON" = 1 ] && _tt=目录 || _tt=Contents ;;
+                esac
+            fi
+            set -- "$@" -V "toc-title=$_tt"
+        fi
+        [ -n "$O_TEMPLATE" ] && set -- "$@" "--template=$O_TEMPLATE"
+        _oldifs=$IFS; IFS=$NL
+        for _h in $INCLUDE $O_INCLUDE; do
+            [ -n "$_h" ] && [ -f "$_h" ] && set -- "$@" "--include-in-header=$_h"
+        done
+        IFS=$_oldifs
+        [ -n "$O_BIB" ] && set -- "$@" "--bibliography=$O_BIB"
+        [ -n "$O_CSL" ] && set -- "$@" "--csl=$O_CSL"
+        ;;
+    html)
+        if [ "$TO" = pdf ]; then
+            set -- "$@" --standalone            # pandoc 自行管理中间 HTML
+        else
+            set -- "$@" --standalone --embed-resources
+        fi
+        _oldifs=$IFS; IFS=$NL
+        for _c in $O_CSS; do [ -n "$_c" ] && [ -f "$_c" ] && set -- "$@" "--css=$_c"; done
+        IFS=$_oldifs
+        [ "$TOC" = 1 ] && set -- "$@" --toc --toc-depth="$TOCDEPTH"
+        [ "$NUMBERS" = 1 ] && set -- "$@" --number-sections
+        ;;
+    typst)
+        set -- "$@" --standalone
+        [ -n "$FONTSIZE" ] && set -- "$@" -V "fontsize=$FONTSIZE"
+        [ "$TOC" = 1 ] && set -- "$@" --toc --toc-depth="$TOCDEPTH"
+        ;;
+    *)
+        set -- "$@" --standalone
+        ;;
+    esac
+
+    [ -n "$O_METADATA_FILE" ] && set -- "$@" "--metadata-file=$O_METADATA_FILE"
+    [ -n "$O_RESOURCE_PATH" ] && set -- "$@" "--resource-path=$O_RESOURCE_PATH"
+    append_lines "$USER_ARGS"
+
+    if [ "$DRY" = 1 ]; then
+        printf '\n%s[pandoc]%s ' "$C_B" "$C_0"
+        for _a in "$@"; do
+            case $_a in
+                *[!A-Za-z0-9_./=:@%+,^-]*) printf "'%s' " "$_a" ;;
+                *) printf '%s ' "$_a" ;;
+            esac
+        done
+        printf '\n\n'
+        return 0
+    fi
+
+    dbg "pandoc $*"
+    _errf=$(mktemp "${TMPDIR:-/tmp}/md2pdf-err.XXXXXX")
+    "$PANDOC" "$@" 2>"$_errf"
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        err "转换失败 (退出码 $_rc) → $_bout"
+        grep -vE '^[[:space:]]*$' "$_errf" | tail -20 | sed 's/^/    /' >&2
+        rm -f "$_errf"
+        return "$_rc"
+    fi
+    _bad=$(grep -iE 'LaTeX Error|Font .* not (found|loadable)|! Emergency stop|Undefined control sequence' "$_errf" | head -3)
+    if [ -n "$_bad" ]; then
+        printf '%s' "$_bad" | sed "s/^/${C_Y}    ⚠ /;s/\$/${C_0}/" >&2
+    fi
+    rm -f "$_errf"
+    return 0
+}
+
+# ------------------------------------------------------------ 单文件转换 -----
+# 缓存目录：优先 XDG，其次 TMPDIR；都不可写则关闭增量跳过
+pick_cache_dir() {
+    for _d in "${SIG_CACHE_DIR:-}" "${TMPDIR:-/tmp}/md2pdf-cache-$(id -u 2>/dev/null || echo 0)"; do
+        [ -n "$_d" ] || continue
+        if mkdir -p "$_d" 2>/dev/null && [ -w "$_d" ]; then printf '%s\n' "$_d"; return 0; fi
+    done
+    printf '\n'
+}
+SIG_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf
+
+ext_for() {
+    if [ "${PNG_MODE:-0}" = 1 ]; then echo png; return 0; fi
+    case $TO in
+        pdf|beamer) echo pdf ;; html) echo html ;; docx) echo docx ;;
+        tex) echo tex ;; epub) echo epub ;; pptx) echo pptx ;; *) echo "$TO" ;;
+    esac
+}
+
+# 中间件扩展名：PNG 模式下 pandoc 仍然要产出 PDF
+build_ext() {
+    if [ "${PNG_MODE:-0}" = 1 ]; then echo pdf; else ext_for; fi
+}
+
+base_noext() {   # 文件名去掉目录与 .md/.markdown 后缀
+    _bn=${1##*/}
+    case $_bn in
+        *.md)       _bn=${_bn%.md} ;;
+        *.markdown) _bn=${_bn%.markdown} ;;
+    esac
+    printf '%s\n' "$_bn"
+}
+
+out_for() {
+    _in=$1; _ext=$(ext_for)
+    if [ -n "$OUTDIR" ]; then
+        printf '%s/%s.%s\n' "${OUTDIR%/}" "$(base_noext "$_in")" "$_ext"
+        return
+    fi
+    if [ -n "$OUTPUT" ]; then
+        case $OUTPUT in
+            */)   printf '%s%s.%s\n' "$OUTPUT" "$(base_noext "$_in")" "$_ext" ;;
+            *)    if [ -d "$OUTPUT" ]; then
+                      printf '%s/%s.%s\n' "${OUTPUT%/}" "$(base_noext "$_in")" "$_ext"
+                  else printf '%s\n' "$OUTPUT"; fi ;;
+        esac
+        return
+    fi
+    _d=${_in%/*}; [ "$_d" = "$_in" ] && _d=.
+    printf '%s/%s.%s\n' "$_d" "$(base_noext "$_in")" "$_ext"
+}
+
+signature() {
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+        "$VERSION" "$QUALITY" "$ENGINE" "$TO" "$FONTSIZE" "$MARGIN" "$LINESTRETCH" \
+        "$MAIN_FONT" "$RESOLVED_CJK" "$USE_CJK_VAR" "$MONO_FONT" "$HIGHLIGHT" \
+        "$TOC" "$TOCDEPTH" "$NUMBERS" "$DOCCLASS" "$CLASSON" "$USER_ARGS" \
+        "$PNG_MODE" "$PNG_DPI" "$PNG_TRANSPARENT" | hash_str
+}
+
+# --------------------------------------------------------------- 栅格化 -------
+# PDF → PNG：按质量排序探测可用工具，能用的就用最好的，并如实报告是否降级。
+# 与网页端 server/raster.mjs 的优先级保持一致（pdftoppm > pdftocairo > gs >
+# mutool > sips），这样 CLI 与网页导出的结果可预期地一致。
+# 选出将要使用的栅格化工具（仅用于 -n 干跑时展示）
+pick_raster_tool() {
+    if   have pdftoppm;   then echo pdftoppm
+    elif have pdftocairo; then echo pdftocairo
+    elif have gs;         then echo gs
+    elif have mutool;     then echo mutool
+    elif have sips;       then echo sips
+    else echo '(无可用工具)'; fi
+}
+
+rasterize_pdf() {   # $1 = 输入 PDF   $2 = 输出 PNG
+    _rpdf=$1; _rpng=$2
+    _dpi=${PNG_DPI:-200}; _page=${PNG_PAGE:-1}
+    _base=${_rpng%.png}
+    _extra=''
+    [ "$PNG_TRANSPARENT" = 1 ] && _extra='-transp'
+
+    if have pdftoppm; then
+        # shellcheck disable=SC2086
+        if pdftoppm -png -r "$_dpi" -f "$_page" -l "$_page" $_extra -singlefile "$_rpdf" "$_base" 2>/dev/null && [ -s "$_rpng" ]; then
+            RASTER_TOOL=pdftoppm; return 0
+        fi
+    fi
+    if have pdftocairo; then
+        # shellcheck disable=SC2086
+        if pdftocairo -png -r "$_dpi" -f "$_page" -l "$_page" $_extra -singlefile "$_rpdf" "$_base" 2>/dev/null && [ -s "$_rpng" ]; then
+            RASTER_TOOL=pdftocairo; return 0
+        fi
+    fi
+    if have gs; then
+        _dev=png16m; [ "$PNG_TRANSPARENT" = 1 ] && _dev=pngalpha
+        if gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=$_dev -r "$_dpi" \
+              -dFirstPage="$_page" -dLastPage="$_page" \
+              -dTextAlphaBits=4 -dGraphicsAlphaBits=4 \
+              -sOutputFile="$_rpng" "$_rpdf" 2>/dev/null && [ -s "$_rpng" ]; then
+            RASTER_TOOL=gs; return 0
+        fi
+    fi
+    if have mutool; then
+        if mutool draw -q -r "$_dpi" -o "$_rpng" -F png "$_rpdf" "$_page" 2>/dev/null && [ -s "$_rpng" ]; then
+            RASTER_TOOL=mutool; return 0
+        fi
+    fi
+    if have sips; then
+        if sips -s format png "$_rpdf" --out "$_rpng" >/dev/null 2>&1 && [ -s "$_rpng" ]; then
+            # sips 只能按 72dpi 出图，用重采样逼近目标宽度（质量降级，明确告知）
+            _w=$(sips -g pixelWidth "$_rpng" 2>/dev/null | awk '/pixelWidth/{print $2}')
+            case $_w in ''|*[!0-9]*) _w=0 ;; esac
+            if [ "$_w" -gt 0 ]; then
+                _want=$(( _w * _dpi / 72 ))
+                [ "$_want" -gt "$_w" ] && sips --resampleWidth "$_want" "$_rpng" >/dev/null 2>&1
+            fi
+            RASTER_TOOL=sips
+            warn "PNG 使用 macOS 内置 sips 降级渲染（72dpi 放大），文字边缘会偏软"
+            warn "如需真正高清：brew install poppler   然后重新运行"
+            return 0
+        fi
+    fi
+
+    err "没有可用的 PDF→PNG 工具，无法完成栅格化"
+    err "  任选其一: brew install poppler | brew install ghostscript | brew install mupdf-tools"
+    err "  或改用网页工作台 (md2pdf serve) 的 HTML 引擎导出 PNG，无需外部工具"
+    return 1
+}
+
+convert_one() {
+    _in=$1
+    _out=$(out_for "$_in")
+    _dir=${_out%/*}
+    [ -d "$_dir" ] || mkdir -p "$_dir" || { err "无法创建目录 $_dir"; return 1; }
+
+    resolve_fonts "$_in"
+
+    if [ -n "$SIG_CACHE_DIR" ] && [ "$FORCE" != 1 ] && [ "$DRY" != 1 ] \
+       && [ -f "$_out" ] && [ "$_out" -nt "$_in" ]; then
+        _sigf=$SIG_CACHE_DIR/$(printf '%s' "$_out" | hash_str).sig
+        if [ -f "$_sigf" ] && [ "$(cat "$_sigf")" = "$(signature)" ]; then
+            note "${C_D}跳过(未变更)${C_0} $_out"
+            return 0
+        fi
+    fi
+
+    _t0=$(date +%s)
+
+    if [ "$KEEP_TEX" = 1 ] && [ "$TO" = pdf ] && [ "$FAMILY" = latex ] && [ "$DRY" != 1 ]; then
+        _save_to=$TO; TO=tex
+        build_and_run "$_in" "${_out%.*}.tex" || warn "生成 .tex 失败(继续生成 PDF)"
+        TO=$_save_to
+        case $TO in beamer) FAMILY=latex ;; esac
+    fi
+
+    if [ "$DRY" = 1 ]; then
+        if [ "$PNG_MODE" = 1 ]; then
+            build_and_run "$_in" "${_out%.png}.pdf"
+            printf '\n%s[rasterize]%s %s  %s --dpi %s --page %s%s → %s\n\n' \
+                "$C_B" "$C_0" "$(pick_raster_tool)" "${_out%.png}.pdf" \
+                "$PNG_DPI" "$PNG_PAGE" \
+                "$([ "$PNG_TRANSPARENT" = 1 ] && printf ' --transparent')" "$_out"
+        else
+            build_and_run "$_in" "$_out"
+        fi
+        return $?
+    fi
+
+    # 临时文件必须保留真实扩展名：pandoc 依据扩展名决定是否调用 PDF 引擎
+    _tmp_out="${_out%.*}.md2pdf.$$.$(build_ext)"
+    if ! build_and_run "$_in" "$_tmp_out"; then
+        rm -f "$_tmp_out"
+        return 1
+    fi
+
+    if [ "$PNG_MODE" = 1 ]; then
+        if ! rasterize_pdf "$_tmp_out" "$_out"; then
+            rm -f "$_tmp_out"
+            return 1
+        fi
+        if [ "$PNG_KEEP_PDF" = 1 ]; then
+            mv -f "$_tmp_out" "${_out%.png}.pdf" 2>/dev/null || rm -f "$_tmp_out"
+        else
+            rm -f "$_tmp_out"
+        fi
+    else
+        mv -f "$_tmp_out" "$_out" || { err "写入失败: $_out"; rm -f "$_tmp_out"; return 1; }
+    fi
+
+    if [ -n "$SIG_CACHE_DIR" ]; then
+        signature > "$SIG_CACHE_DIR/$(printf '%s' "$_out" | hash_str).sig" 2>/dev/null
+    fi
+
+    _t1=$(date +%s)
+    _size=$(wc -c < "$_out" 2>/dev/null | tr -d ' ')
+    _secs=$(( _t1 - _t0 ))
+    [ "$_secs" = 0 ] && _secs='<1'
+    note "${C_G}✓${C_0} ${_out} ${C_D}(${_secs}s · $(( ${_size:-0} / 1024 )) KB)${C_0}"
+    [ "$OPEN_AFTER" = 1 ] && have open && open "$_out"
+    return 0
+}
+
+# -------------------------------------------------------------- watch 模式 ---
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+watch_loop() {
+    _cnt=$(printf '%s\n' "$INPUTS" | grep -c .)
+    [ "$_cnt" = 1 ] || die "-w 监听模式一次只支持一个文件" 1
+
+    _sig=''
+    _oldifs=$IFS; IFS=$NL
+    for _f in $INPUTS; do _sig="$_sig$(mtime_of "$_f"):$(hash_file "$_f");"; done
+    IFS=$_oldifs
+
+    info "${C_B}监听中${C_0} $INPUTS  ${C_D}(Ctrl-C 退出 · 间隔 ${WATCH_INTERVAL}s)${C_0}"
+    convert_one "$INPUTS" || true
+    trap 'cleanup; printf "\n" >&2; info "已停止监听"; exit 0' INT TERM HUP
+    while :; do
+        sleep "$WATCH_INTERVAL"
+        _new=''
+        _oldifs=$IFS; IFS=$NL
+        for _f in $INPUTS; do _new="$_new$(mtime_of "$_f"):$(hash_file "$_f");"; done
+        IFS=$_oldifs
+        [ "$_new" = "$_sig" ] && continue
+        _sig=$_new
+        info "${C_D}$(date '+%H:%M:%S') 检测到改动，重新编译…${C_0}"
+        convert_one "$INPUTS" || true
+    done
+}
+
+# ------------------------------------------------------------------ 主流程 ---
+main() {
+    # `md2pdf serve` → 交给 Node 后台（网页工作台）。放在最前面是为了让所有
+    # 参数原样透传，不被本脚本的解析器吞掉。
+    case ${1:-} in
+    serve|web|studio)
+        shift
+        _mdp="$MD2PDF_HOME/bin/mdp.mjs"
+        [ -f "$_mdp" ] || die "找不到网页工作台入口: $_mdp  (请确认 md2pdf 与 bin/ 在同一目录)" 4
+        have node || die "md2pdf serve 需要 node ≥ 20（内置全局 WebSocket）" 4
+        exec node "$_mdp" serve "$@"
+        ;;
+    esac
+
+    parse_args "$@"
+
+    [ "${INITCFG:-0}" = 1 ] && cmd_init_config
+    # doctor/list 的 JSON 形态交给 Node 侧统一产出，避免两份事实来源
+    if [ "${JSON_OUT:-0}" = 1 ] && [ "${DOCTOR:-0}" = 1 ]; then
+        _mdp="$MD2PDF_HOME/bin/mdp.mjs"
+        if [ -f "$_mdp" ] && have node; then exec node "$_mdp" doctor --json; fi
+        err "doctor --json 需要 node ≥ 20 与 bin/mdp.mjs"; exit 4
+    fi
+    [ "${DOCTOR:-0}" = 1 ] && cmd_doctor
+    find_pandoc
+    [ "${LIST_ARGS:-0}" = 1 ] && cmd_list
+
+    # 无参数：当前目录只有一个 .md 时直接用它
+    if [ -z "${FILES:-}" ]; then
+        _n=$(set -- ./*.md; [ -e "$1" ] && printf '%s' "$#" || printf 0)
+        if [ "$_n" = 1 ]; then
+            set -- ./*.md; FILES=$1
+            info "${C_D}自动选择: $FILES${C_0}"
+        else
+            usage_err "缺少输入文件"
+        fi
+    fi
+
+    # 展开输入：目录 → 其中所有 .md；"-" → 标准输入
+    INPUTS=''
+    _oldifs=$IFS; IFS=$NL
+    for _f in $FILES; do
+        if [ -d "$_f" ]; then
+            _found=0
+            for _g in "$_f"/*.md "$_f"/*.markdown; do
+                [ -f "$_g" ] && { INPUTS="${INPUTS}${INPUTS:+$NL}$_g"; _found=1; }
+            done
+            [ "$_found" = 0 ] && warn "目录中没有 .md 文件: $_f"
+        elif [ "$_f" = "-" ]; then
+            _tmpin=$(mktemp "${TMPDIR:-/tmp}/md2pdf-stdin.XXXXXX")
+            cat > "$_tmpin"
+            INPUTS="${INPUTS}${INPUTS:+$NL}$_tmpin"
+            STDIN_TMP="${STDIN_TMP:-}${STDIN_TMP:+ }$_tmpin"
+        elif [ -f "$_f" ]; then
+            INPUTS="${INPUTS}${INPUTS:+$NL}$_f"
+        else
+            err "文件不存在: $_f"; FAIL_EARLY=1
+        fi
+    done
+    IFS=$_oldifs
+    [ "${FAIL_EARLY:-0}" = 1 ] && exit 4
+    [ -n "$INPUTS" ] || usage_err "没有可转换的文件"
+
+    finalize
+    SIG_CACHE_DIR=$(pick_cache_dir)
+    [ -n "$SIG_CACHE_DIR" ] || dbg "缓存目录不可写，已关闭增量跳过"
+
+    case $JOBS in ''|*[!0-9]*) JOBS=1 ;; esac
+    [ "$JOBS" -lt 1 ] && JOBS=1
+    WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-1}
+
+    [ "$WATCH" = 1 ] && { watch_loop; exit $?; }
+
+    _n=$(printf '%s\n' "$INPUTS" | grep -c .)
+
+    if [ "$DRY" = 1 ]; then
+        _oldifs=$IFS; IFS=$NL
+        for _f in $INPUTS; do convert_one "$_f"; done
+        IFS=$_oldifs
+        exit 0
+    fi
+
+    [ "$_n" -gt 1 ] && info "${C_B}md2pdf${C_0} ${_n} 个文件 · 档位 ${C_G}${QUALITY}${C_0} · 引擎 ${ENGINE} · 并行 ${JOBS}"
+
+    if [ "$_n" = 1 ] || [ "$JOBS" = 1 ]; then
+        _fails=0
+        _oldifs=$IFS; IFS=$NL
+        for _f in $INPUTS; do convert_one "$_f" || _fails=$((_fails + 1)); done
+        IFS=$_oldifs
+        [ "$_fails" = 0 ] || { err "$_fails 个文件转换失败"; exit 3; }
+        exit 0
+    fi
+
+    _sd=$(mktemp -d "${TMPDIR:-/tmp}/md2pdf-jobs.XXXXXX")
+    _i=0; _run=0
+    _oldifs=$IFS; IFS=$NL
+    for _f in $INPUTS; do
+        _i=$((_i + 1))
+        ( convert_one "$_f"; printf '%s' "$?" > "$_sd/$_i" ) &
+        _run=$((_run + 1))
+        [ "$_run" -ge "$JOBS" ] && { wait; _run=0; }
+    done
+    IFS=$_oldifs
+    wait
+    _fails=0
+    for _s in "$_sd"/*; do [ -f "$_s" ] && [ "$(cat "$_s")" != 0 ] && _fails=$((_fails + 1)); done
+    rm -rf "$_sd"
+    [ "$_fails" = 0 ] || { err "$_fails 个文件转换失败"; exit 3; }
+    exit 0
+}
+
+# ------------------------------------------------------------------ 入口 -----
+cleanup() { [ -n "${STDIN_TMP:-}" ] && rm -f $STDIN_TMP 2>/dev/null; return 0; }
+trap cleanup EXIT INT TERM HUP
+
+# ---- 变量初始化（必须在 set -u 下先声明）----
+QUIET=0; VERBOSE=0; DRY=0; FORCE=0; OPEN_AFTER=0; KEEP_TEX=0; WATCH=0
+SELFTEST=0; LIST_ARGS=0; DOCTOR=0; INITCFG=0; FAIL_EARLY=0
+QUALITY=${MD2PDF_QUALITY:-std}
+TO=${MD2PDF_TO:-pdf}
+PNG_MODE=0; PNG_DPI=${MD2PDF_PNG_DPI:-200}; PNG_PAGE=${MD2PDF_PNG_PAGE:-1}
+PNG_TRANSPARENT=0; PNG_KEEP_PDF=0; JSON_OUT=0; RASTER_TOOL=''
+JOBS=${MD2PDF_JOBS:-1}
+WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-1}
+CJK_MODE=${MD2PDF_CJK:-auto}
+OUTPUT=''; OUTDIR=''; USER_ARGS=''; FILES=''; INPUTS=''
+STDIN_TMP=''; CONF_FILES=''
+PANDOC=''; PANDOC_VER=''; ENGINE=''; FAMILY=''
+O_ENGINE=''; O_FONTSIZE=''; O_MARGIN=''; O_LINESTRETCH=''; O_TOC=''
+O_TOCDEPTH=''; O_NUMBERS=''; O_MAIN_FONT=''; O_CJK_FONT=''; O_MONO_FONT=''
+O_HIGHLIGHT=''; O_COLORLINKS=''; O_DOCCLASS=''; O_CLASSON=''; O_TOC_TITLE=''
+O_TEMPLATE=''; O_INCLUDE=''; O_CSS=''; O_BIB=''; O_CSL=''; O_LANG=''
+O_METADATA_FILE=''; O_RESOURCE_PATH=''
+FONTSIZE=''; MARGIN=''; LINESTRETCH=''; TOC=0; TOCDEPTH=2; NUMBERS=0
+COLORLINKS=0; DOCCLASS=''; CLASSON=''; HIGHLIGHT=''; GEOM_EXTRA=''; INCLUDE=''
+MAIN_FONT=''; MONO_FONT=''; CJK_FONT=auto; RESOLVED_CJK=''; USE_CJK_VAR=0; CJK_ON=0
+
+# --------------------------------------------------------------- 用户配置 ----
+for _c in "$MD2PDF_HOME/md2pdf.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/md2pdf/config.sh"; do
+    if [ -n "${MD2PDF_CONFIG:-}" ] && [ "$_c" = "$MD2PDF_HOME/md2pdf.conf" ]; then continue; fi
+    if [ -f "$_c" ]; then
+        . "$_c"
+        CONF_FILES="${CONF_FILES}${CONF_FILES:+, }$_c"
+    fi
+done
+if [ -n "${MD2PDF_CONFIG:-}" ]; then
+    [ -f "$MD2PDF_CONFIG" ] || die "配置文件不存在: $MD2PDF_CONFIG" 4
+    . "$MD2PDF_CONFIG"
+    CONF_FILES="${CONF_FILES}${CONF_FILES:+, }$MD2PDF_CONFIG"
+fi
+
+main "$@"

@@ -1,0 +1,23 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+web/dist/
+.npm-cache/
+.artifacts/
+.cache/
+*.log
+
+# ---- 渲染中间产物 ----
+*.aux
+*.dvi
+*.out
+*.toc
+*.nav
+*.snm
+*.synctex.gz
+!examples/**/*.pdf
+
+# ---- 系统 ----
+.DS_Store
+
+# ---- 方案 B 的 Python 虚拟环境 ----
+.venv/

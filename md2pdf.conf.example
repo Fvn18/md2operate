@@ -1,0 +1,45 @@
+# =============================================================================
+#  md2pdf 用户配置模板
+#
+#  安装到以下任一位置即可被自动加载（后者覆盖前者）：
+#    ~/.config/md2pdf/config.sh      ← 推荐，用 `md2pdf init-config` 生成
+#    <脚本目录>/md2pdf.conf
+#  也可以临时指定：  md2pdf --config ./my.conf 论文.md
+#
+#  这本质上就是一段 shell，可以直接写逻辑、调用命令。
+# =============================================================================
+
+# ---- 默认质量档位: draft | std | high | press | cn | screen | slides --------
+MD2PDF_QUALITY=std
+
+# ---- PDF 引擎: xelatex(推荐, 中文最佳) | lualatex | tectonic -----------------
+MD2PDF_ENGINE=xelatex
+
+# ---- 字体 -------------------------------------------------------------------
+MD2PDF_MAIN_FONT="Times New Roman"   # 西文正文
+MD2PDF_CJK_FONT=auto                 # auto: macOS 用 PingFang SC；也可写 "Songti SC"
+MD2PDF_MONO_FONT="Menlo"             # 等宽（代码块）
+
+# ---- 版式微调（留空表示沿用档位默认）---------------------------------------
+# MD2PDF_FONTSIZE=11pt
+# MD2PDF_MARGIN=1.2in
+
+# ---- 批量并行数（按 CPU 核数设置比较合适）-----------------------------------
+MD2PDF_JOBS=1
+# MD2PDF_JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+# ---- watch 模式轮询间隔（秒）------------------------------------------------
+# MD2PDF_WATCH_INTERVAL=1
+
+# ---- 中文处理: auto(按内容探测) | on(总是) | off(从不) ----------------------
+# MD2PDF_CJK=auto
+
+# ---- 追加给每一次转换的 pandoc 参数（每行一个）------------------------------
+# MD2PDF_EXTRA_ARGS="--citeproc
+# --bibliography=$HOME/Documents/refs.bib
+# --csl=$HOME/Documents/chinese-gb7714-2015.csl"
+
+# ---- 按目录自动换档（示例：论文目录用 cn 档）--------------------------------
+# case "$PWD" in
+#     */papers/*|*/论文/*) MD2PDF_QUALITY=cn ;;
+# esac

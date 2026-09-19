@@ -1,0 +1,60 @@
+{
+  "name": "mdp-studio",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MDP Studio — Markdown → PNG / TeX-PDF，终端与浏览器双模工作台",
+  "bin": {
+    "mdp": "bin/mdp.mjs"
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "dev": "vite --config web/vite.config.ts",
+    "build": "vite build --config web/vite.config.ts",
+    "serve": "node bin/mdp.mjs serve",
+    "bench": "node scripts/bench.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "node scripts/verify.mjs",
+    "verify:ai": "node scripts/verify-ai.mjs",
+    "verify:export": "node scripts/verify-export.mjs",
+    "verify:sync": "node scripts/verify-sync.mjs",
+    "verify:python": "node scripts/verify-python.mjs",
+    "verify:ui": "node scripts/verify-ui.mjs",
+    "verify:all": "npm run verify && npm run verify:ai && npm run verify:export && npm run verify:sync && npm run verify:vim && npm run verify:python && npm run verify:ui",
+    "verify:vim": "node scripts/verify-vim.mjs"
+  },
+  "dependencies": {
+    "highlight.js": "^11.12.0",
+    "katex": "^0.18.7",
+    "markdown-it": "^15.0.2",
+    "markdown-it-deflist": "^4.0.0",
+    "markdown-it-footnote": "^4.0.0",
+    "markdown-it-task-lists": "^2.1.1"
+  },
+  "devDependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/search": "^6.7.2",
+    "@codemirror/state": "^6.7.5",
+    "@codemirror/view": "^6.43.12",
+    "@lezer/highlight": "^1.2.3",
+    "@replit/codemirror-vim": "^6.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/katex": "^0.16.8",
+    "@types/markdown-it": "^14.2.0",
+    "@types/node": "^26.6.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.0"
+  }
+}

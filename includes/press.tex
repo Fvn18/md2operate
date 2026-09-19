@@ -1,0 +1,18 @@
+% =============================================================================
+%  md2pdf —— press 档位附加的页眉页脚
+%  用 -H/--include-in-header 加载；也可以用同样方式挂载自己的 LaTeX 片段。
+% =============================================================================
+\usepackage{fancyhdr}
+\setlength{\headheight}{16pt}
+\pagestyle{fancy}
+\fancyhf{}
+% 双面排版：外侧页码，内侧章标题
+\fancyhead[LE,RO]{\small\thepage}
+\fancyhead[LO]{\small\nouppercase{\rightmark}}
+\fancyhead[RE]{\small\nouppercase{\leftmark}}
+\fancyfoot[C]{}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+% 让 \leftmark/\rightmark 拿到 section 级标题
+\renewcommand{\sectionmark}[1]{\markright{\thesection\ #1}}
+\renewcommand{\subsectionmark}[1]{}

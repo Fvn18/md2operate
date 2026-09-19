@@ -1,0 +1,5 @@
+# 方案 B（Python/FastAPI 分发模式）的依赖。
+# 只有这三项：渲染引擎仍是 Node（见 mdp_server.py 顶部的设计取舍说明）。
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27

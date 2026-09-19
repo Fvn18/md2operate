@@ -1,0 +1,86 @@
+#compdef md2pdf m2p
+# zsh 补全：md2pdf / m2p
+# 启用方式（二选一）：
+#   1. ./install.sh --with-completion
+#   2. 在 ~/.zshrc 手动加入：
+#        fpath=("/Users/fubin/task/C题/scripts/completions" $fpath)
+#        autoload -Uz compinit && compinit
+
+_md2pdf() {
+    local -a qualities engines formats
+    qualities=(
+        'draft:极速草稿(10pt, 无目录)'
+        'std:标准(默认)'
+        'high:高质量(目录+行距)'
+        'press:印刷排版(双面页眉)'
+        'cn:中文论文(ctex 宋体)'
+        'screen:屏幕阅读'
+        'slides:Beamer 幻灯片'
+    )
+    engines=(xelatex lualatex tectonic pdflatex typst wkhtmltopdf weasyprint)
+    formats=(pdf html docx tex epub pptx beamer)
+
+    _arguments -s -S \
+        '(-h --help)'{-h,--help}'[显示帮助]' \
+        '--version[显示版本]' \
+        '(-q --quality)'{-q,--quality}'[质量档位]:档位:->quality' \
+        '(-e --engine)'{-e,--engine}'[PDF 引擎]:引擎:($engines)' \
+        '(-o --output)'{-o,--output}'[输出文件]:文件:_files' \
+        '(-d --outdir)'{-d,--outdir}'[输出目录]:目录:_files -/' \
+        '(-t --to)'{-t,--to}'[输出格式]:格式:($formats)' \
+        '(-f --force)'{-f,--force}'[强制重建]' \
+        '(-n --dry-run)'{-n,--dry-run}'[只打印命令]' \
+        '(-k --keep-tex)'{-k,--keep-tex}'[保留 .tex]' \
+        '(-O --open)'{-O,--open}'[完成后打开]' \
+        '(-w --watch)'{-w,--watch}'[监听文件变化]' \
+        '(-j --jobs)'{-j,--jobs}'[并行数]:数量:' \
+        '(-s --var)'{-s,--var}'[pandoc 变量 -V]:KEY=VAL:' \
+        '(-M --metadata)'{-M,--metadata}'[pandoc 元数据 -M]:KEY=VAL:' \
+        '--toc[开启目录]' \
+        '--no-toc[关闭目录]' \
+        '--toc-depth[目录深度]:层数:(1 2 3 4 5)' \
+        '--toc-title[目录标题]:标题:' \
+        '--numbers[章节编号]' \
+        '--no-numbers[取消编号]' \
+        '--fontsize[字号]:字号:(10pt 11pt 12pt)' \
+        '--margin[页边距]:尺寸:(0.8in 1.0in 1.2in 2cm)' \
+        '--linestretch[行距]:倍数:(1.0 1.15 1.25 1.35 1.5)' \
+        '--mainfont[西文字体]:字体:' \
+        '--cjkfont[中文字体]:字体:' \
+        '--monofont[等宽字体]:字体:' \
+        '--cjk[中文处理]:模式:(auto on off)' \
+        '--highlight[代码高亮]:样式:(tango kate pygments espresso zenburn breezeDark monochrome)' \
+        '--colorlinks[彩色链接]' \
+        '--no-colorlinks[黑色链接]' \
+        '--documentclass[文档类]:类:(article ctexart report book beamer)' \
+        '--classoption[文档类选项]:选项:' \
+        '--lang[语言]:语言:(zh en)' \
+        '--template[pandoc 模板]:文件:_files' \
+        '(-H --include-in-header)'{-H,--include-in-header}'[LaTeX 头部片段]:文件:_files' \
+        '--css[HTML 样式]:文件:_files' \
+        '--bibliography[参考文献库]:文件:_files' \
+        '--csl[CSL 样式]:文件:_files' \
+        '--citeproc[启用引用处理]' \
+        '--metadata-file[元数据文件]:文件:_files' \
+        '--resource-path[资源搜索路径]:路径:_files -/' \
+        '--pdf-engine-opt[引擎参数]:参数:' \
+        '--config[配置文件]:文件:_files' \
+        '--quiet[安静模式]' \
+        '--verbose[详细输出]' \
+        '--clean[清理缓存]' \
+        '--selftest[自检]' \
+        '1: :->cmd' \
+        '*:Markdown 文件:_files -g "*.md *.markdown"'
+
+    case $state in
+        quality) _describe '质量档位' qualities ;;
+        cmd)
+            _alternative \
+                'files:Markdown 文件:_files -g "*.md *.markdown"' \
+                'subcmds:子命令:(doctor list init-config)' \
+                'dirs:目录:_files -/'
+            ;;
+    esac
+}
+
+_md2pdf "$@"

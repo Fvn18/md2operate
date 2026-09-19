@@ -1,0 +1,126 @@
+#compdef mdp
+# ---------------------------------------------------------------------------
+#  mdp —— MDP Studio 的 zsh 补全
+#  安装：把本文件放入 $fpath 中的任一目录，例如
+#      cp completions/_mdp ~/.zsh/completions/    # 并在 .zshrc 里 fpath+=(~/.zsh/completions)
+#  或将本目录加入 fpath：
+#      fpath=("$MD2PDF_HOME/completions" $fpath)
+# ---------------------------------------------------------------------------
+
+_mdp() {
+    local -a commands
+    commands=(
+        'serve:启动网页工作台（后台 + 浏览器）'
+        'build:直接产出文件，不打开网页'
+        'doctor:环境体检（pandoc / LaTeX / Chromium / 栅格化器）'
+        'presets:查看质量档位'
+        'routes:查看导出路线'
+        'themes:查看文档主题'
+        'clean:清空 .artifacts 产物目录'
+        'help:显示帮助'
+        'version:显示版本'
+    )
+
+    local -a formats
+    formats=(png pdf pdf-html tex html docx md)
+
+    local -a qualities
+    qualities=(draft fast q0 std standard normal q1 high hq q2 press print q3 cn paper thesis q4 screen web ebook q5 slides beamer q6)
+
+    local -a themes
+    themes=(paper github academic sepia ink nord mono)
+
+    local -a papers
+    papers=(A4 A5 B5 Letter Legal A3 slide)
+
+    _arguments -C \
+        '1: :->cmd' \
+        '*:: :->args'
+
+    case $state in
+    cmd)
+        _describe -t commands 'mdp 子命令' commands
+        _files -g '*.md(-.)'
+        ;;
+    args)
+        case $words[1] in
+        build|render|make)
+            _arguments \
+                '(-t --to)'{-t,--to}'[输出格式]:格式:(($formats))' \
+                '--via[产出引擎]:引擎:(html latex)' \
+                '(-q --quality --preset)'{-q,--quality,--preset}'[质量档位]:档位:(($qualities))' \
+                '(-e --engine)'{-e,--engine}'[LaTeX 引擎]:引擎:(xelatex lualatex pdflatex tectonic typst)' \
+                '(-o --output)'{-o,--output}'[输出文件]:文件:_files' \
+                '(-d --outdir)'{-d,--outdir}'[输出目录]:目录:_files -/' \
+                '--name[文档基名（配合 --stdin）]:名称:' \
+                '--stdin[从标准输入读 Markdown]' \
+                '--dpi[PNG 分辨率]:dpi:(150 300 600)' \
+                '--page[PNG 取第几页]:页码:' \
+                '--card[分享卡片样式]' \
+                '--no-card[整页样式]' \
+                '--card-pad[卡片内边距 px]:px:' \
+                '--transparent[透明背景]' \
+                '--theme[文档主题]:主题:(($themes))' \
+                '--width[正文宽度 px]:宽度:' \
+                '--paper[纸张]:纸张:(($papers))' \
+                '--font-size[正文字号 px]:字号:' \
+                '--line-height[行距]:行距:' \
+                '--font[正文字体预设]:字体:(serifLatin sansLatin songti heiti kaiti mono)' \
+                '--heading-font[标题字体预设]:字体:(serifLatin sansLatin songti heiti kaiti mono)' \
+                '--code-theme[highlight.js 主题]:主题:' \
+                '--accent[主题强调色]:颜色:' \
+                '--title[文档标题]:标题:' \
+                '--author[作者]:作者:' \
+                '--date[日期]:日期:' \
+                '--no-meta[隐藏文档信息块]' \
+                '--toc[LaTeX 路线生成目录]' \
+                '--no-toc[关闭目录]' \
+                '--toc-depth[目录深度]:深度:' \
+                '--numbers[章节编号]' \
+                '--no-numbers[关闭编号]' \
+                '--numbering[定理/引理自动编号]' \
+                '--breaks[软换行即换行]' \
+                '--embed-toc[正文内嵌目录]' \
+                '--line-numbers[代码块行号]' \
+                '--justify[两端对齐]' \
+                '--indent[首行缩进]:缩进:' \
+                '--linestretch[行距倍数]:倍数:' \
+                '--mainfont[LaTeX 正文字体]:字体:' \
+                '--cjkfont[LaTeX 中文字体]:字体:' \
+                '--monofont[LaTeX 等宽字体]:字体:' \
+                '--highlight[代码高亮风格]:风格:(tango kate pygments breezedark espresso zenburn monochrome haddock)' \
+                '--documentclass[文档类]:类:(article ctexart report book beamer)' \
+                '*--classoption[文档类选项]:选项:' \
+                '*{-H,--include-in-header}[追加 LaTeX 头部片段]:文件:_files -g "*.tex"' \
+                '*{-s,--var}[pandoc 变量]:键值:' \
+                '*{-M,--metadata}[pandoc 元数据]:键值:' \
+                '--citeproc[启用引用处理]' \
+                '--bibliography[参考文献]:文件:_files -g "*.bib"' \
+                '--csl[CSL 样式]:文件:_files -g "*.csl"' \
+                '(-f --force)'{-f,--force}'[忽略缓存]' \
+                '(-n --dry-run)'{-n,--dry-run}'[只打印将要执行的命令]' \
+                '(-k --keep --keep-pdf)'{-k,--keep,--keep-pdf}'[保留中间文件]' \
+                '--json[以 JSON 输出产物信息]' \
+                '(-Q --quiet)'{-Q,--quiet}'[安静模式]' \
+                '(-v --verbose)'{-v,--verbose}'[详细输出]' \
+                '*:Markdown 文件:_files -g "*.md(-.)"'
+            ;;
+        serve|web|studio)
+            _arguments \
+                '--port[监听端口]:端口:(8757 8080 3000)' \
+                '--host[监听地址]:地址:(127.0.0.1)' \
+                '--concurrency[并发渲染数]:数量:(1 2 4)' \
+                '--token[访问令牌]:令牌:' \
+                '--no-open[不自动打开浏览器]' \
+                '(-Q --quiet)'{-Q,--quiet}'[安静模式]' \
+                '(-v --verbose)'{-v,--verbose}'[详细输出]'
+            ;;
+        doctor|presets)
+            _arguments '--json[以 JSON 输出]'
+            ;;
+        esac
+        ;;
+    esac
+}
+
+_mdp "$@"

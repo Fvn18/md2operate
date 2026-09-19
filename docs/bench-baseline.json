@@ -1,0 +1,51 @@
+{
+  "chars": 100000,
+  "at": "2026-09-18T07:12:41.656Z",
+  "metrics": {
+    "boot": {
+      "ms": 1385
+    },
+    "loadDoc": {
+      "ms": 251,
+      "inPageMs": 0,
+      "chars": 100000
+    },
+    "renderFull": {
+      "min": 79,
+      "p50": 96.4,
+      "p95": 111.9,
+      "max": 111.9,
+      "avg": 93.2
+    },
+    "typeLatency": {
+      "min": 39,
+      "p50": 41,
+      "p95": 42.8,
+      "max": 141.9,
+      "avg": 44.4
+    },
+    "scrollFps": {
+      "avg": 60,
+      "worst": 56.5,
+      "frames": 119
+    },
+    "exportPng": {
+      "ms": 1234,
+      "bytes": 2408661,
+      "width": 2953,
+      "height": 16719
+    },
+    "exportPdf": {
+      "ms": 3827,
+      "bytes": 60914,
+      "width": null,
+      "height": null
+    },
+    "bundle": {
+      "files": 139,
+      "totalBytes": 2979531,
+      "firstLoadBytes": 1213614,
+      "fontsBytes": 256168
+    }
+  }
+}

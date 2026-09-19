@@ -1,0 +1,30 @@
+#!/bin/sh
+# =============================================================================
+#  mdp —— MDP Studio 统一入口
+#
+#  仓库内可直接用：      ./mdp serve
+#  安装后（./install.sh）会软链到 ~/.local/bin/mdp，全局可用。
+#
+#  本文件只是一层"找得到真正的入口"的壳：它解析自身软链（因此从任何地方调用
+#  都能定位到仓库），然后把参数原样交给 bin/mdp.mjs。
+# =============================================================================
+set -u
+
+_rp=$0
+while [ -L "$_rp" ]; do
+    _d=$(cd -P "$(dirname "$_rp")" >/dev/null 2>&1 && pwd) || break
+    _rp=$(readlink "$_rp")
+    case $_rp in
+        /*) ;;
+        *) _rp=$_d/$_rp ;;
+    esac
+done
+_dir=$(cd -P "$(dirname "$_rp")" >/dev/null 2>&1 && pwd) || _dir=.
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "mdp 需要 Node.js ≥ 20（内置全局 WebSocket）" >&2
+    echo "  安装：brew install node@22" >&2
+    exit 4
+fi
+
+exec node "$_dir/bin/mdp.mjs" "$@"
