@@ -163,7 +163,10 @@ preset_load() {
         P_DESC='中文论文 (ctex)'
         P_FONTSIZE=''; P_MARGIN=1.1in; P_LINESTRETCH=''; P_TOC=1; P_TOCDEPTH=2
         P_NUMBERS=1; P_COLORLINKS=1; P_DOCCLASS=ctexart; P_CLASSON='zihao=-4'
-        P_HIGHLIGHT=tango; P_GEOM_EXTRA='' ;;
+        P_HIGHLIGHT=tango; P_GEOM_EXTRA=''
+        # 页眉默认会把拉丁词大写（Markdown → MARKDOWN）；press 档早有 \nouppercase 处理，
+        # 这里给 cn 档补上同一套，见 includes/ctex-head.tex
+        [ -f "$MD2PDF_HOME/includes/ctex-head.tex" ] && P_INCLUDE="$MD2PDF_HOME/includes/ctex-head.tex" ;;
     screen|web|ebook|q5)
         P_DESC='屏幕阅读'
         P_FONTSIZE=11pt; P_MARGIN=0.9in; P_LINESTRETCH=1.35; P_TOC=1; P_TOCDEPTH=3
@@ -475,7 +478,8 @@ parse_args() {
         -e|--engine)      [ $# -ge 2 ] || usage_err "$1 需要参数"; O_ENGINE=$2; shift 2 ;;
         -o|--output)      [ $# -ge 2 ] || usage_err "$1 需要参数"; OUTPUT=$2; shift 2 ;;
         -d|--outdir)      [ $# -ge 2 ] || usage_err "$1 需要参数"; OUTDIR=$2; shift 2 ;;
-        -t|--to)          [ $# -ge 2 ] || usage_err "$1 需要参数"; TO=$2; shift 2 ;;
+        -t|--to)          [ $# -ge 2 ] || usage_err "$1 需要参数"; TO=$2; TO_EXPLICIT=1; shift 2 ;;
+        -t=*|--to=*)      TO=${1#*=}; TO_EXPLICIT=1; shift ;;
         --dpi)            [ $# -ge 2 ] || usage_err "$1 需要参数"; PNG_DPI=$2; shift 2 ;;
         --dpi=*)          PNG_DPI=${1#*=}; shift ;;
         --page)           [ $# -ge 2 ] || usage_err "$1 需要参数"; PNG_PAGE=$2; shift 2 ;;
@@ -541,7 +545,47 @@ parse_args() {
 }
 
 # -------------------------------------------------------------- 参数装配 -----
+# 没给 -t 时，按 -o 的扩展名推断输出格式。
+#
+# 为什么需要：`md2pdf -o 手册.docx 手册.md` 以前会产出**一个名叫 .docx 的 PDF** ——
+# 不报错、不提示，直到用户双击打开被 Word 告知"文件已损坏"。这类错标比失败更糟：
+# 失败会让人去查，错标会让人以为程序坏了。
+# 规则：只在用户**没有显式指定** -t（含 MD2PDF_TO 环境变量）时推断；
+# 显式给了 -t 就完全听它的，只在与扩展名明显冲突时提醒一句。
+infer_to_from_output() {
+    [ -z "$OUTPUT" ] && return 0
+    [ -d "$OUTPUT" ] && return 0            # 输出的是目录，交给 out_for 决定文件名
+
+    _ext=${OUTPUT##*.}
+    [ "$_ext" = "$OUTPUT" ] && return 0     # 没有扩展名
+    case $_ext in
+        png)  _guess=png  ;; pdf) _guess=pdf ;; html|htm) _guess=html ;;
+        tex)  _guess=tex  ;; docx) _guess=docx ;; md) _guess=md ;;
+        epub) _guess=epub ;; pptx) _guess=pptx ;;
+        svg|jpg|jpeg|webp|txt) return 0 ;;  # 我们不产这些，别乱猜
+        *) return 0 ;;
+    esac
+
+    if [ "$TO_EXPLICIT" = 1 ]; then
+        # 显式指定的格式与扩展名对不上 —— 不阻止，但要说出来
+        case "$TO:$(_norm_ext "$TO")" in
+            *":$_ext") ;;
+            # 变量一律加花括号：后面紧跟中文标点时，shell 会把标点的字节
+            # 当成变量名的一部分（实测 "名是 .$_ext，" 报 `_ext￼: unbound variable`，
+            # 而 "${_ext}" 正常）。本脚本满屏中文提示，这条要一直遵守。
+            *) warn "输出文件名是 .${_ext}，但 -t 指定的是 ${TO}；产物内容会是 ${TO} 格式" ;;
+        esac
+        return 0
+    fi
+
+    TO=$_guess
+    dbg "按输出扩展名推断格式: -t $_guess"
+}
+
+_norm_ext() { case $1 in png) echo png ;; pdf|beamer) echo pdf ;; *) echo "$1" ;; esac; }
+
 finalize() {
+    infer_to_from_output
     preset_load "$QUALITY"
     FONTSIZE=$P_FONTSIZE; MARGIN=$P_MARGIN; LINESTRETCH=$P_LINESTRETCH
     TOC=$P_TOC; TOCDEPTH=$P_TOCDEPTH; NUMBERS=$P_NUMBERS; COLORLINKS=$P_COLORLINKS
@@ -642,6 +686,22 @@ build_and_run() {
     case $FAMILY in
     latex)
         set -- "$@" --standalone
+        # `:::` 容器在 LaTeX 路线下的支持（细节见 includes/callouts.lua 开头的说明）。
+        # 过滤器本身对非 LaTeX 输出会退化成带类的 Div，所以 docx 也挂上 --
+        # 不挂的话 `::: 定理 标题` 在 docx 里就是三个冒号的原样文本。
+        # 但 .tex 样式只对 LaTeX 写的目标有意义，别的目标别塞进去。
+        case $TO in
+        pdf|beamer|tex|docx)
+            [ -f "$MD2PDF_HOME/includes/callouts.lua" ] && \
+                set -- "$@" --lua-filter "$MD2PDF_HOME/includes/callouts.lua"
+            case $TO in
+            pdf|beamer|tex)
+                [ -f "$MD2PDF_HOME/includes/callouts.tex" ] && \
+                    set -- "$@" "--include-in-header=$MD2PDF_HOME/includes/callouts.tex"
+                ;;
+            esac
+            ;;
+        esac
         [ "$TO" = beamer ] && set -- "$@" --slide-level="${MD2PDF_SLIDE_LEVEL:-2}"
         [ -n "$DOCCLASS" ] && set -- "$@" -V "documentclass=$DOCCLASS"
         _oldifs=$IFS; IFS=$NL
@@ -1250,6 +1310,8 @@ QUIET=0; VERBOSE=0; DRY=0; FORCE=0; OPEN_AFTER=0; KEEP_TEX=0; WATCH=0
 SELFTEST=0; LIST_ARGS=0; DOCTOR=0; INITCFG=0; FAIL_EARLY=0
 QUALITY=${MD2PDF_QUALITY:-std}
 TO=${MD2PDF_TO:-pdf}
+TO_EXPLICIT=0
+[ -n "${MD2PDF_TO:-}" ] && TO_EXPLICIT=1
 PNG_MODE=0; PNG_DPI=${MD2PDF_PNG_DPI:-200}; PNG_PAGE=${MD2PDF_PNG_PAGE:-1}
 PNG_TRANSPARENT=0; PNG_KEEP_PDF=0; JSON_OUT=0; RASTER_TOOL=''
 JOBS=${MD2PDF_JOBS:-1}

@@ -1,0 +1,27 @@
+% =============================================================================
+%  md2pdf —— cn 档位（ctexart）的页眉修正
+%
+%  为什么需要这个文件：
+%  ctexart 的 headings 页眉会把章标题整条交给 \MakeUppercase。对纯中文标题无所谓，
+%  但技术文档的标题里常有拉丁词（Markdown、API、PDF），大写之后就成了 "MARKDOWN"，
+%  同一份文档在正文里写 Markdown、在页眉里变 MARKDOWN，看起来像是排版出错。
+%
+%  press 档位早就用 \nouppercase{\rightmark} 处理过这件事（见 press.tex）。
+%  这里按同一套模式给 cn 档补上，保持两档行为一致。
+% =============================================================================
+
+\usepackage{fancyhdr}
+\setlength{\headheight}{15pt}
+\pagestyle{fancy}
+\fancyhf{}
+% 左页眉：章标题，原样保留大小写；右页眉：页码
+\fancyhead[L]{\small\nouppercase{\rightmark}}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+% 页眉只放标题文本，不放 \thesection：
+% pandoc 在 --no-numbers 时用 \setcounter{secnumdepth}{-\maxdimen} 关掉编号，
+% 此时 \thesection 仍是 0，写进页眉会得到 "0.<n>" 这种没有意义的编号。
+% 标题本身该带编号的（如本手册的 "4. 写作：…"）写在标题里就行。
+\renewcommand{\sectionmark}[1]{\markright{#1}}
+\renewcommand{\subsectionmark}[1]{}

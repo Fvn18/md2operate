@@ -1,0 +1,25 @@
+% =============================================================================
+%  md2pdf —— `:::` 容器在 LaTeX 路线下的排版样式
+%
+%  与 includes/callouts.lua 配套：过滤器把 `::: 定理 标题 … :::` 与 `::: note … :::`
+%  转成 \begin{mdpcallout}{标签 标题} … \end{mdpcallout}，这里定义它长什么样。
+%
+%  只用 LaTeX 核心命令（\rule / quote / \textbf），不引入任何额外宏包 ——
+%  容器的可用性不应该取决于用户装没装某个包。
+% =============================================================================
+
+\providecommand{\mdpcalloutrulewidth}{0.5pt}
+
+\newenvironment{mdpcallout}[1]{%
+  \par\addvspace{\medskipamount}%
+  \noindent\rule{\linewidth}{\mdpcalloutrulewidth}\par\nobreak
+  \vspace{3pt}\nobreak
+  \begin{quote}%
+    \noindent #1\par\nobreak\smallskip\nobreak\noindent\ignorespaces
+}{%
+    \par
+  \end{quote}%
+  \vspace{3pt}\nobreak
+  \noindent\rule{\linewidth}{\mdpcalloutrulewidth}\par
+  \addvspace{\medskipamount}%
+}
