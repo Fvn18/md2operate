@@ -28,6 +28,18 @@ mdp serve            # 打开 http://127.0.0.1:8757
 
 ![工作台](docs/screenshot.png)
 
+**想找什么，去哪一节：**
+
+| 你要找的 | 去哪 |
+|:--|:--|
+| 每项能力**从哪调用、实现在哪一行** | [§6.1 调用与实现索引](#61-调用与实现索引) |
+| 面向使用者的完整说明（可导出 PDF） | [`docs/manual.md`](docs/manual.md) → `manual.pdf` / `manual.docx` |
+| 想加/改一个功能，该动哪个文件 | [§9 扩展方式](#9-扩展方式) |
+| 命令行参数全集 | `mdp help <命令> --all`，或 [§10 原有 md2pdf 参考](#10-原有-md2pdf-参考) |
+| 出问题了 | `mdp doctor`，或 [§8 自检与故障排查](#8-自检与故障排查) |
+| 实测数据与已知缺陷 | [`docs/technical-report.md`](docs/technical-report.md) |
+| 核心实现怎么写的 | [`docs/core-walkthrough.md`](docs/core-walkthrough.md) |
+
 ---
 
 ## 1. 设计取舍：为什么是这套架构
@@ -252,46 +264,150 @@ curl -N "localhost:8757/api/jobs/$JOB/events"
 ```
 scripts/
 ├── mdp                       # 兼容入口（→ bin/mdp.mjs），保留旧习惯
-├── md2pdf                    # POSIX sh 引擎（已扩展：PNG / --json / serve）
+├── md2pdf                    # POSIX sh 引擎（PDF/PNG/DOCX/TEX、缓存、watch、并发）
 ├── install.sh                # 软链 md2pdf / m2p / mdp + 写 ~/.zshrc 受管块
-├── bin/mdp.mjs               # 统一 CLI：serve / build / doctor / presets / routes / themes / clean
+├── bin/mdp.mjs               # 统一 CLI：serve / build / doctor / list / routes / themes / clean / help
 ├── server/                   # 零依赖 Node 后台
 │   ├── server.mjs            # HTTP 路由、静态托管、SSE、同步/异步渲染
 │   ├── render.mjs            # 渲染管线（HTML 路线 / LaTeX 路线 / 直通）
 │   ├── chrome.mjs            # 手写 CDP 驱动：真 DPI 截图、clip、透明背景、printToPDF
-│   ├── raster.mjs            # PDF→PNG 多级回退（poppler/gs/mutool/sips）
-│   ├── jobs.mjs              # 任务队列 + 日志/进度广播 + 取消
-│   ├── caps.mjs              # 能力探测 / 预检
+│   ├── raster.mjs            # PDF→PNG 多级回退（pdftoppm/pdftocairo/gs/mutool/sips）
+│   ├── jobs.mjs              # 任务队列 + 日志/进度广播 + 取消 + supersede
+│   ├── caps.mjs              # 能力探测 / 逐路线预检（ROUTE_DEPS）
 │   ├── presets.mjs           # 档位桥接（读 md2pdf list --json）
-│   ├── estimate.mjs          # 导出耗时预估（学习本机真实耗时，双策略）
+│   ├── estimate.mjs          # 导出耗时预估（学习本机真实耗时）
 │   ├── ai.mjs                # Gemini 代理（Interactions API，零 npm 依赖）
 │   ├── config.mjs            # 配置持久化（密钥 0600，永不回传浏览器）
 │   ├── python/               # 方案 B：FastAPI 宿主 + requirements.txt
 │   └── util.mjs              # 子进程、路径、HTTP 小工具
 ├── shared/                   # 预览与导出**共用**（纯 ESM，浏览器/Node 同构）
 │   ├── markdown.mjs          # Markdown + KaTeX + 高亮 + 容器 + 自动编号 + 目录
-│   ├── incremental.mjs       # 块级增量渲染（预览性能的核心，含导出包装）
-│   └── theme.mjs             # 文档样式表、主题、纸张、导出页骨架
+│   ├── incremental.mjs       # 按 token 流分块（预览性能的核心，含导出包装）
+│   ├── preview-engine.mjs    # 差量协议 v2：身份继承 + 行区间补丁 + seed 预热
+│   ├── scroll-map.mjs        # 行 ↔ 像素双向插值映射（纯函数，Node 可断言）
+│   ├── theme.mjs             # 文档样式表、主题、纸张、导出页骨架
+│   ├── persist.mjs           # 持久化内核（IndexedDB + 降级 localStorage）
+│   └── merge-docs.mjs        # 首屏索引与远端正文的合并策略
+├── includes/                 # LaTeX 片段（按档位挂载）
+│   ├── press.tex             # press 档页眉页脚
+│   ├── ctex-head.tex         # cn 档页眉（保留拉丁词大小写）
+│   ├── callouts.lua          # `:::` 容器在 LaTeX 路线的渲染
+│   └── callouts.tex          # 容器的 LaTeX 环境定义
 ├── web/                      # Vite + React + CodeMirror 工作台
 │   ├── vite.config.ts        # root=web，别名 @shared → ../shared
-│   └── src/{App.tsx,components/,lib/}
+│   └── src/
+│       ├── App.tsx           # 装配与同步编排
+│       ├── components/       # EditorPane / PreviewPane / ExportDrawer / …
+│       ├── lib/              # content / preview-client / preview-state / persist / api / store
+│       └── worker/render.worker.ts   # 预览渲染 Worker（解析与排版离开主线程）
 ├── examples/                 # 示例库（网页「示例」面板直接读取）
-│   ├── quadratic-extrema-theorem.md   # 二次型极值点对称性：完整证明
-│   └── demo.md
+├── docs/                     # 技术报告、走读、用户手册、企业规格
 ├── completions/_md2pdf, _mdp  # zsh 补全
-└── scripts/                  # 7 个自检套件 + 性能基准
-    ├── verify.mjs            # 渲染/导出（28 项）
+└── scripts/                  # 13 个自检脚本 + 性能基准
+    ├── verify.mjs            # 渲染/导出（27 项）
+    ├── verify-preview.mjs    # 差量引擎（39 项）
+    ├── verify-scrollmap.mjs  # 行↔像素映射（28 项）
+    ├── verify-persist.mjs    # 持久化（29 项）
+    ├── verify-cancel.mjs     # 取消与熔断（23 项）
+    ├── verify-kernel.mjs     # md2pdf 内核四组极端用例（22 项）
+    ├── verify-docs.mjs       # 文档门禁：禁用词 / REQ 验收字段
     ├── verify-ai.mjs         # AI 代理与密钥安全（20 项）
     ├── verify-export.mjs     # 进度/预估/1200 DPI（14 项）
     ├── verify-sync.mjs       # 锚定式滚动同步（4 项）
     ├── verify-vim.mjs        # Vim 完整度（13 项）
-    ├── verify-python.mjs     # 方案 B 网关与 SSE（17 项）
     ├── verify-ui.mjs         # 浏览器内 AI 全链路（16 项）
-    ├── bench.mjs             # 性能基准
+    ├── verify-python.mjs     # 方案 B 网关与 SSE
+    ├── bench.mjs             # 性能基准（--viewport 固定窗口）
     └── lib/synth-doc.mjs     # 合成语料（无副作用，可复用）
 ```
 
 `.artifacts/<jobId>/` 存放每次渲染的产物（含源 `.md`），可用 `mdp clean` 清空。
+`docs/` 下的三类文档：`technical-report.md`（实测与缺陷）、`core-walkthrough.md`（源码走读）、
+`manual.md`（用户手册，可编译成 `manual.pdf` / `manual.docx`）。
+
+### 6.1 调用与实现索引
+
+**按能力查**：每一项能力 → 从哪里调用 → 实现在哪个文件的哪一行。
+行号是写这份文档时的真实值，改动后请以符号名为准。
+
+#### 渲染内核（前端预览与后端导出共用同一份代码）
+
+| 能力 | 怎么调用 | 实现在哪 |
+|:--|:--|:--|
+| Markdown + KaTeX + 高亮 | 预览与全部导出路线 | `shared/markdown.mjs` `createRenderer` :600、`renderMarkdown` :687 |
+| `:::` 容器（中英双语别名） | 写 `::: 定理 标题 … :::` | 别名表 `shared/markdown.mjs` `CALLOUT_ALIASES` :53、视觉表 `CALLOUT_META` :79 |
+| 容器在 LaTeX 路线生效 | 自动（`-t pdf/tex/docx`） | `includes/callouts.lua` + `includes/callouts.tex` |
+| 按 token 流分块 | 自动 | `shared/incremental.mjs` `groupTokens` :41、`hashStr` :26 |
+| 导出 HTML 包装（与预览同构） | 导出时 | `shared/incremental.mjs` `blocksToHtml` :88 |
+| 差量协议 v2（身份继承 + 行区间补丁） | 自动 | `shared/preview-engine.mjs` `createPreviewEngine` :63 |
+| 客户端差量应用（引用不变） | 自动 | `shared/preview-engine.mjs` `applyDelta` :281、自校验 `verifyDelta` :325 |
+| 行 ↔ 像素双向插值 | 滚动同步 / 虚拟化 | `shared/scroll-map.mjs` `buildScrollIndex` :58、`lineToY` :158、`yToLine` :174 |
+| 虚拟化视口计算 | 自动（≥60 块） | `shared/scroll-map.mjs` `visibleRange` :213、滚动锚定 `anchorAt` :264 |
+| 文档样式表（预览与导出同源） | 两侧都调用 | `shared/theme.mjs` `documentCss` :89 |
+| 导出页骨架 | 导出时 | `shared/theme.mjs` `buildExportHtml` :620 |
+| 纸张尺寸 / 单位换算 | 版式计算 | `shared/theme.mjs` `PAPER_SIZES` :40、`mmToPx` :51 |
+
+#### 网页工作台
+
+| 能力 | 怎么调用 | 实现在哪 |
+|:--|:--|:--|
+| 内容热路径 store（不进 React state） | 打字即触发 | `web/src/lib/content.ts` `setContent` :38 |
+| 预览渲染 Worker（最新优先） | 自动 | `web/src/worker/render.worker.ts`（`pump()` :47） |
+| Worker 生命周期与降级 | 自动 | `web/src/lib/preview-client.ts`（`publish` :141、`previewEngineInfo` :352） |
+| 预览面板 / 虚拟化 / 缩放 | 界面 | `web/src/components/PreviewPane.tsx`（`Block` :74、`measure` :166、`syncRange` :283） |
+| 导出面板与进度 | 界面 | `web/src/components/ExportDrawer.tsx` |
+| 本地持久化 | 自动 | `shared/persist.mjs` `createPersistence` :38、`web/src/lib/persist.ts` |
+| 首屏与远端正文合并 | 启动时 | `shared/merge-docs.mjs` `mergeDocs` :22 |
+| 自检钩子（`window.__mdpBench`） | 测试用 | `web/src/lib/diagnostics.ts` `installBenchHooks` :70 |
+
+#### 后端 HTTP
+
+| 能力 | 怎么调用 | 实现在哪 |
+|:--|:--|:--|
+| 起服务与路由 | `mdp serve` | `server/server.mjs` `startServer` :82 |
+| 渲染编排（含取消） | `POST /api/render` | `server/render.mjs` `executeRender` :371、`abortable` :606 |
+| 请求归一化 | 自动 | `server/render.mjs` `normalizeRequest` :337 |
+| 真 DPI 截图 / 透明 / 裁剪 | PNG 路线 | `server/chrome.mjs` `ChromePage.screenshot` :457 |
+| PDF 打印 | `pdf-html` 路线 | `server/chrome.mjs` `printToPdf` :477 |
+| PDF → PNG 多级回退 | PNG(LaTeX) 路线 | `server/raster.mjs` `pdfToPng` :97 |
+| 任务队列 / 取消 / supersede | `POST /api/jobs/:id/cancel` | `server/jobs.mjs` `JobManager` :19 |
+| 能力探测 / 逐路线预检 | `GET /api/caps`、`mdp doctor` | `server/caps.mjs` `probeCaps` :42、`preflight` :214 |
+| 耗时预估（自学习） | 导出进度 | `server/estimate.mjs` `recordTiming` :54、`estimateTiming` :107 |
+| AI 代理 | `POST /api/ai/*` | `server/ai.mjs` `runTask` :402 |
+
+#### 命令行
+
+| 能力 | 怎么调用 | 实现在哪 |
+|:--|:--|:--|
+| 统一 CLI 与子命令分发 | `mdp <命令>` | `bin/mdp.mjs`（`COMMANDS` 表） |
+| LaTeX 路线委托 | `mdp build -t pdf` | `bin/mdp.mjs` 转发给 `md2pdf` |
+| 质量档位定义 | `-q <档位>` | `md2pdf` `preset_load()` :137 |
+| 惰性依赖解析 | 自动 | `md2pdf` `ensure_pandoc` :102、`ensure_pandoc_version` :108 |
+| 缓存签名（决定是否跳过） | 自动 | `md2pdf` `signature()` :840 |
+| 缓存目录选择 | 自动 | `md2pdf` `pick_cache_dir` :769 |
+| 单文件转换主流程 | 自动 | `md2pdf` `convert_one` :926 |
+| 构造并执行 pandoc | 自动 | `md2pdf` `build_and_run` :637 |
+| 栅格化回退链 | `-t png` | `md2pdf` `rasterize_pdf` :867 |
+| 多文件并发（滑动窗口） | `-j N` | `md2pdf` `main` :1117（并发段 :1217 起） |
+| 监听重建 | `-w` | `md2pdf` `watch_loop` :1093 |
+| 监听走内核事件 | 装了 `fswatch` 即自动 | `md2pdf` `watch_events_fswatch` :1067 |
+| 杀掉上一次编译 | 监听时自动 | `md2pdf` `watch_kill_running` :1031、收尾 `watch_teardown` :1050 |
+| 源文件指纹 | 监听轮询 | `md2pdf` `source_fingerprint` :1012 |
+| `--config` 预扫描 | `--config FILE` | `md2pdf` `prescan_config` :447 |
+| 页眉（cn 档） | `-q cn` 自动挂载 | `includes/ctex-head.tex` |
+| 页眉页脚（press 档） | `-q press` 自动挂载 | `includes/press.tex` |
+
+#### 自检
+
+| 想验证什么 | 命令 | 实现在哪 |
+|:--|:--|:--|
+| 渲染同构 / 真 DPI / PDF 结构 | `npm run verify` | `scripts/verify.mjs` |
+| 差量引擎与导出逐字节一致 | `npm run verify:preview` | `scripts/verify-preview.mjs` |
+| 行↔像素映射与虚拟化 | `npm run verify:scrollmap` | `scripts/verify-scrollmap.mjs` |
+| 取消与熔断 | `npm run verify:cancel` | `scripts/verify-cancel.mjs` |
+| md2pdf 内核极端用例 | `npm run verify:kernel` | `scripts/verify-kernel.mjs` |
+| 文档禁用词与需求验收字段 | `npm run verify:docs` | `scripts/verify-docs.mjs` |
+| 性能回归 | `npm run bench -- --baseline docs/bench-baseline.json` | `scripts/bench.mjs` |
 
 ---
 
@@ -337,6 +453,8 @@ npm run verify:ai       # AI 代理与配置安全（mock 模式，无需密钥�
 npm run verify:export   # 进度事件 / 耗时预估学习 / 1200 DPI
 npm run verify:sync     # 锚定式滚动同步（像素级判据）
 npm run verify:vim      # Vim 完整度（操作符 / 计数 / 寄存器 / 宏 / 搜索）
+npm run verify:kernel   # md2pdf 内核：惰性依赖 / 并发上限 / watch 不堆积 / 环境剥夺
+npm run verify:docs     # 规格文档门禁（禁用词 / 需求验收字段）
 npm run verify:python   # 方案 B：FastAPI 网关与 SSE 流式转发
 npm run verify:ui       # 真实浏览器里的 AI 全链路
 npm run bench           # 性能基准（可 --baseline 对比历史）
@@ -352,7 +470,7 @@ md2pdf doctor --selftest  # 原有的实编译自检（draft / std / cn 三档�
 |:--|:--|
 | 页面空白 / 按钮无反应 | 多半是 `web/dist` 未构建：`npm run build`。未构建时后台会给出说明页 |
 | PNG 报「未找到 Chromium」 | 设 `MDP_CHROME=/path/to/chrome`；`mdp doctor` 会显示当前探测到的路径 |
-| PNG(LaTeX 路线) 偏软 | 当前只有 `sips` 回退：`brew install poppler` 后重跑 |
+| PNG(LaTeX 路线) 偏软 | 高清栅格化工具都不可用，降级到系统内置工具（脚本会如实警告）：`brew install poppler` 或 `brew install ghostscript` |
 | 公式显示为纯文本 | 检查是否误用了单个 `$` 包裹多行；多行请用 `$$` 独占一行 |
 | 中文不出字 / 缺字 | 中文 PDF 用 `-q cn`（ctex）；HTML 路线确认系统装了 PingFang/Noto CJK |
 | 端口被占用 | `mdp serve` 会自动向后找端口；也可 `--port` 指定 |
@@ -554,7 +672,9 @@ PDF→PNG 多级回退。在 Python 里再写一遍意味着**两套实现长期
 | `off` | 关闭（`⌘⇧L` 循环切换） |
 
 实测结果（`verify-sync.mjs`，6 万字符文档）：滚到第 50 / 300 / 900 / 1500 行，
-预览顶部块分别覆盖 **50-52 / 300-300 / 897-900 / 1497-1500**，偏移稳定在 8px。
+预览顶部块分别覆盖 **50-52 / 300-300 / 897-900 / 1497-1500**。
+像素偏移实测为 **17–41px**（随块高与块内插值位置变化），判据是「编辑器当前行落在预览顶部块的行区间内」，
+所以偏移不会随滚动累积——这是它比比例同步稳定的地方。
 
 ::: warning 这里连踩两个坑，值得记下来
 ① `lineBlockAtHeight` 的坐标空间容易搞错（文档高度 vs 视口高度），算出的行号偏小，
@@ -578,7 +698,9 @@ npm run bench -- --json out.json --baseline docs/bench-baseline.json   # 与基�
 
 `scripts/bench.mjs` 会真的起后台 + Chromium，把 10 万字符灌进编辑器，用
 `Input.dispatchKeyEvent` 逐字符发**真实按键**，测「按键 → 下一帧绘制完成」的端到端
-延迟；再用 Long Animation Frame 把每帧拆成 script / style+layout / render。
+延迟。滚动帧率则是在 2 秒内线性滚动预览并统计逐帧间隔。
+注：该指标强依赖窗口尺寸（预览面板越窄、fit 缩放越小、可见布局像素越多、需要挂载的块越多），
+所以 `bench.mjs` 提供 `--viewport WxH`，比较历史数字时必须先固定窗口。
 
 ### 结果（10 万字符；`docs/bench-baseline.json` 为存档基线）
 
@@ -589,7 +711,7 @@ npm run bench -- --json out.json --baseline docs/bench-baseline.json   # 与基�
 | **预览增量渲染** | 全量 170 ms | **1/1151 块重渲 · ~3 ms** | — |
 | 应用冷启动 | 657 ms | 283–330 ms | ▼ 57% |
 | 载入 10 万字符 → 可交互 | — | 303–380 ms | — |
-| 预览滚动帧率 | 49.3 fps（最低 26.6） | **60.0 fps**（最低 56） | ▲ 22% |
+| 预览滚动帧率 | 49.3 fps（最低 26.6） | **55.7 fps**（1400×900 窗口）<br>35.1 fps（800×600 且导出面板打开）| 见下方说明 |
 | 全量渲染 p50 | 253.9 ms | 136–161 ms | ▼ 46% |
 
 ::: remark 两条"优化本身也会带来回归"的实测教训
@@ -639,7 +761,7 @@ DOM 无限堆积（10 万节点 → 17 万）→ 页面冻死、滚动跌到 1.4
 
 | 指标 | 优化前 | 优化后 |
 |:--|--:|--:|
-| dist 总体积 | 3709 KB / 179 文件 | **2909 KB / 139 文件** |
+| dist 总体积 | 3709 KB / 179 文件 | **3495 KB / 140 文件**（`npm run bench` 实测） |
 | 首屏 JS+CSS | — | **1360 KB**（gzip ≈ 381 KB） |
 | 字体 | 1048 KB（woff2+woff+ttf 全带） | **250 KB**（只留 woff2） |
 
