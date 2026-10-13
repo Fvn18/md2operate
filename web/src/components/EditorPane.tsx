@@ -13,6 +13,8 @@ export interface EditorPaneHandle {
   insert: (text: string, caretMarker?: string) => void;
   focus: () => void;
   scrollToLine: (line: number) => void;
+  /** 只滚动、不抢焦点不动光标（预览 → 编辑器同步） */
+  scrollToLineQuiet: (line: number, frac?: number) => void;
   setScrollRatio: (r: number) => void;
   scrollRatio: () => number;
   openSearch: () => void;
@@ -113,6 +115,7 @@ export const EditorPane = forwardRef<EditorPaneHandle, Props>(function EditorPan
     cursorContext: (before, after) => handleRef.current?.cursorContext(before, after) ?? { before: '', after: '', pos: 0 },
     focus: () => handleRef.current?.focus(),
     scrollToLine: (line) => handleRef.current?.scrollToLine(line),
+    scrollToLineQuiet: (line, frac) => handleRef.current?.scrollToLineQuiet(line, frac),
     setScrollRatio: (r) => handleRef.current?.setScrollRatio(r),
     scrollRatio: () => handleRef.current?.scrollRatio() ?? 0,
     openSearch: () => handleRef.current?.openSearch(),

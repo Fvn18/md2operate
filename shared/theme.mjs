@@ -210,6 +210,12 @@ ${o.accent ? `.mdp-doc { --mdp-accent: ${esc(o.accent)}; }` : ''}
 .mdp-doc .mdp-block {
   display: block;
   margin: 0;
+  /* 块间距用 padding 而不是 margin：虚拟化要"每块高度自包含"。
+     offsetHeight 不包含外边距，若间距靠 margin，sum(块高) ≠ 内容总高，
+     上下占位块就会错位（滚到中段越滚越偏）。padding 在盒内，量得准。
+     间距数值与原来的外边距折叠结果一致（块内首尾子元素外边距已压成 0），
+     所以预览与导出的排版没有变化。 */
+  padding-top: 0.85em;
   contain: layout style paint;
 }
 /* 只在预览（非静态渲染）里跳过视口外内容；导出必须完整布局，否则截图/分页会缺内容。
@@ -231,29 +237,46 @@ ${o.accent ? `.mdp-doc { --mdp-accent: ${esc(o.accent)}; }` : ''}
 .mdp-doc:not([data-static="1"]) .mdp-block[data-first="ul"],
 .mdp-doc:not([data-static="1"]) .mdp-block[data-first="ol"] { contain-intrinsic-size: auto 90px; }
 .mdp-doc .mdp-block > *:first-child { margin-top: 0 !important; }
+/* 虚拟化打开时，块本来就只挂载视口附近的几十个，不需要（也不该）再让
+   content-visibility 延迟布局——那会让"测到的高度"和"最终高度"不一致，
+   反而把滚动锚定搞歪。 */
+.mdp-doc[data-virtual="1"]:not([data-static="1"]) .mdp-block {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
 /* 导出产物（data-static="1"）里不出现任何交互控件 */
 .mdp-doc[data-static="1"] .err-fix-btn { display: none !important; }
 .mdp-doc .mdp-block > *:last-child { margin-bottom: 0 !important; }
 
-/* 块间距：原先靠外边距折叠，现在由包装元素给出。
-   数值刻意与折叠后的结果对齐，保证换成分块包装后**文档高度基本不变**
-   （实测：10 万字符文档 15063px → 标定后回到同一量级；见 scripts/bench.mjs）。 */
-.mdp-doc .mdp-block + .mdp-block { margin-top: 0.85em; }
+/* 块间距（padding-top，默认 0.85em 已在上面的 .mdp-block 里给出）：
+   按"下一块是什么标签"微调，数值与当初外边距折叠的结果一致——切换成 padding
+   之后文档总高不变（实测 10 万字符文档仍是同一量级；见 scripts/bench.mjs）。 */
 .mdp-doc .mdp-block[data-first="h1"],
 .mdp-doc .mdp-block[data-first="h2"],
 .mdp-doc .mdp-block[data-first="h3"],
 .mdp-doc .mdp-block[data-first="h4"],
 .mdp-doc .mdp-block[data-first="h5"],
-.mdp-doc .mdp-block[data-first="h6"] { margin-top: 1.6em; }
-.mdp-doc .mdp-block[data-first="hr"] { margin-top: 2em; }
-.mdp-doc .mdp-block[data-first="div"] { margin-top: 1.15em; }   /* callout / 行间公式 */
-.mdp-doc .mdp-block[data-first="figure"] { margin-top: 1.2em; }
-.mdp-doc .mdp-block[data-first="table"] { margin-top: 1em; }
-.mdp-doc .mdp-block[data-first="blockquote"] { margin-top: 1em; }
+.mdp-doc .mdp-block[data-first="h6"] { padding-top: 1.6em; }
+.mdp-doc .mdp-block[data-first="hr"] { padding-top: 2em; }
+.mdp-doc .mdp-block[data-first="div"] { padding-top: 1.15em; }   /* callout / 行间公式 */
+.mdp-doc .mdp-block[data-first="figure"] { padding-top: 1.2em; }
+.mdp-doc .mdp-block[data-first="table"] { padding-top: 1em; }
+.mdp-doc .mdp-block[data-first="blockquote"] { padding-top: 1em; }
 .mdp-doc .mdp-block[data-first="ul"],
-.mdp-doc .mdp-block[data-first="ol"] { margin-top: 0.85em; }
-/* 文档首块不留上边距 */
-.mdp-doc > .mdp-block:first-child { margin-top: 0 !important; }
+.mdp-doc .mdp-block[data-first="ol"] { padding-top: 0.85em; }
+/* 文档首块不留上间距 */
+.mdp-doc > .mdp-block:first-child { padding-top: 0 !important; }
+
+/* 虚拟化的上下占位块：只是一个精确高度的空盒，不参与排版、不被选中。
+   高度 = 视口上方 / 下方所有块的高度和，因此滚动条长度与真实文档一致。 */
+.mdp-doc .mdp-spacer {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  contain: strict;
+  pointer-events: none;
+}
 
 /* ------------------------------------------------------------------ 标题 -- */
 .mdp-doc h1, .mdp-doc h2, .mdp-doc h3,

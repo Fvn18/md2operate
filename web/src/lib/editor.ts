@@ -203,6 +203,12 @@ export interface EditorHandle {
   openSearch: () => void;
   focus: () => void;
   scrollToLine: (line: number) => void;
+  /**
+   * 只滚不改选区/不抢焦点（预览 → 编辑器方向的同步用）。
+   * `frac` 是行在**该行视觉高度**里的比例：长行换行后可能占好几行高度，
+   * 用上它才能让两边的"文档位置"对齐到同一处，而不是行首对行首。
+   */
+  scrollToLineQuiet: (line: number, frac?: number) => void;
   scrollToId: (id: string) => boolean;
   cursorLine: () => number;
   scrollRatio: () => number;
@@ -439,6 +445,13 @@ export function createEditor(opts: EditorOptions): EditorHandle {
       const pos = view.state.doc.line(n).from;
       view.dispatch({ selection: { anchor: pos }, scrollIntoView: true, effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 40 }) });
       view.focus();
+    },
+    scrollToLineQuiet: (line, frac = 0) => {
+      const n = Math.max(1, Math.min(view.state.doc.lines, line));
+      const pos = view.state.doc.line(n).from;
+      const blk = view.lineBlockAt(pos);
+      const y = blk.top + Math.max(0, Math.min(1, frac)) * blk.height;
+      view.scrollDOM.scrollTop = Math.max(0, y);
     },
     scrollToId: () => false,
     cursorLine: () => view.state.doc.lineAt(view.state.selection.main.head).number,

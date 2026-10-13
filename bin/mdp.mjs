@@ -73,8 +73,8 @@ function parseArgs(argv) {
       case '-h': case '--help': o.help = true; break;
       case '--version': o.version = true; break;
       case '-t': case '--to': o.to = take(); bump(); break;
-      case '-o': case '--output': o.output = take(); bump(); break;
-      case '-d': case '--outdir': o.outdir = take(); bump(); break;
+      case '-o': case '--output': case '--out': o.output = take(); bump(); break;
+      case '-d': case '--outdir': case '--out-dir': o.outdir = take(); bump(); break;
       case '-q': case '--quality': case '--preset': o.quality = take(); bump(); break;
       case '-e': case '--engine': o.engine = take(); bump(); break;
       case '--via': o.via = take(); bump(); break;
@@ -137,78 +137,299 @@ function parseArgs(argv) {
       case '-k': case '--keep': case '--keep-pdf': o.keep = true; break;
       case '--stdin': o.stdin = true; break;
       case '--json': o.json = true; break;
+      case '--all': o.all = true; break;
       case '-Q': case '--quiet': QUIET = true; break;
       case '-v': case '--verbose': o.verbose = true; break;
       case '--': o.extra.push(...argv.slice(i + 1)); i = argv.length; break;
       default:
-        if (a.startsWith('-') && a !== '-') { fail(`未知选项 ${a}  (帮助: ${PROG} help)`); process.exit(2); }
+        if (a.startsWith('-') && a !== '-') {
+          // 打错一个参数名只报"未知选项"会让人一个个去翻帮助；这里给最接近的候选。
+          const bare = key.replace(/^--?/, '');
+          const known = Object.values(FLAG_HELP).flatMap((f) => f.keys).map((k) => k.replace(/^--?/, ''));
+          const guess = closest(bare, [...new Set(known)]);
+          fail(`未知选项 ${a}${guess ? `，你是想输入 --${guess} 吗？` : ''}  (帮助: ${PROG} help build)`);
+          process.exit(2);
+        }
         o._.push(a);
     }
   }
   return o;
 }
 
+/* --------------------------------------------------------------- 子命令 --- */
+
+/**
+ * 子命令注册表 —— 单一事实来源。
+ *
+ * 之前命令名散落在 switch 的 case 里，别名又是 `case 'a': case 'b':` 手写的，
+ * 于是出现了三个问题：`mdp list` 其实等于 `presets`（但没人猜得到）、打错字只报
+ * "未知子命令" 不给建议、`mdp help build` 不存在（只有一份巨长的通用帮助）。
+ *
+ * 这里把「规范名 + 别名 + 一句话说明 + 用法示例」集中定义，switch 只认规范名，
+ * 帮助、自动纠错、`mdp help <命令>` 全部从这张表生成，不会再各自跑偏。
+ */
+const COMMANDS = [
+  {
+    name: 'serve', aliases: ['web', 'studio', 'gui'], group: '常用',
+    summary: '启动网页工作台（后台 + 浏览器）',
+    usage: 'mdp serve [--port 8757] [--no-open] [--token 口令] [--python]',
+    flags: ['port', 'host', 'open', 'token', 'python', 'concurrency', 'verbose'],
+  },
+  {
+    name: 'build', aliases: ['render', 'make', 'export'], group: '常用',
+    summary: '直接产出文件，不打开网页',
+    usage: 'mdp build <文件.md ...> [-t png] [--dpi 300] [--card]',
+    flags: ['to', 'via', 'quality', 'engine', 'output', 'outdir', 'name', 'jobs', 'stdin', 'dpi', 'card', 'theme', 'width', 'paper', 'fontSize', 'lineHeight', 'margin', 'cardPadding', 'transparent', 'fontBody', 'fontHeading', 'codeTheme', 'accent', 'title', 'author', 'date', 'showMeta', 'toc', 'tocDepth', 'numbers', 'numbering', 'breaks', 'tocEmbed', 'lineNumbers', 'justify', 'paragraphIndent', 'linestretch', 'mainfont', 'cjkfont', 'monofont', 'highlight', 'documentclass', 'classoption', 'includeHeaders', 'variables', 'metadata', 'citeproc', 'bibliography', 'csl', 'json', 'dryRun', 'force', 'keep', 'quiet', 'verbose', 'extra'],
+  },
+  {
+    name: 'doctor', aliases: ['check', 'env'], group: '常用',
+    summary: '环境体检（pandoc / LaTeX / Chromium / 栅格化器）',
+    usage: 'mdp doctor [--json]',
+    flags: ['json', 'verbose'],
+  },
+  {
+    name: 'list', aliases: ['presets', 'ls'], group: '查询',
+    summary: '查看质量档位 / 导出路线 / 主题（也可只查其中一类）',
+    usage: 'mdp list [presets|routes|themes] [--json]',
+    flags: ['json'],
+  },
+  {
+    name: 'routes', aliases: [], group: '查询',
+    summary: '查看导出路线（-t 可用的值）',
+    usage: 'mdp routes',
+    flags: [],
+  },
+  {
+    name: 'themes', aliases: [], group: '查询',
+    summary: '查看文档主题（--theme 可用的值）',
+    usage: 'mdp themes',
+    flags: [],
+  },
+  {
+    name: 'clean', aliases: ['cleanup'], group: '维护',
+    summary: '清空 .artifacts 产物目录',
+    usage: 'mdp clean [--dry-run]',
+    flags: ['dryRun'],
+  },
+  {
+    name: 'help', aliases: ['--help', '-h'], group: '维护',
+    summary: '查看帮助（mdp help build 看某个命令的全部参数）',
+    usage: 'mdp help [命令]',
+    flags: [],
+  },
+];
+
+/** 别名 → 规范名 */
+const COMMAND_ALIAS = new Map();
+for (const c of COMMANDS) {
+  COMMAND_ALIAS.set(c.name, c.name);
+  for (const a of c.aliases) COMMAND_ALIAS.set(a, c.name);
+}
+
+/** 编辑距离：用来给拼错的子命令/参数一个"你是不是想输入…" */
+function editDistance(a, b) {
+  const m = a.length; const n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+function closest(input, candidates) {
+  let best = null; let bestD = Infinity;
+  for (const c of candidates) {
+    const d = editDistance(input.toLowerCase(), c.toLowerCase());
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  // 只在"足够接近"时提示，避免把毫不相干的词硬凑
+  const limit = Math.max(2, Math.ceil(input.length / 3));
+  return bestD <= limit ? best : null;
+}
+
 /* ------------------------------------------------------------- 帮助 --- */
+
+/**
+ * 参数的规范名 → 展示信息。
+ *
+ * `keys` 里第一项是规范写法，其余都是**继续可用的别名**（老脚本不会因为这次
+ * 统一命名而失效）。帮助文本由这张表生成，所以文档与实际解析逻辑不会再漂移。
+ */
+const FLAG_HELP = {
+  to: { keys: ['-t', '--to'], arg: 'FORMAT', desc: 'png | pdf | pdf-html | tex | html | docx | md（默认 png）' },
+  via: { keys: ['--via'], arg: 'ENGINE', desc: 'html | latex —— 用哪条引擎出图（png 默认 html，pdf 默认 latex）' },
+  quality: { keys: ['-q', '--quality', '--preset'], arg: 'LVL', desc: 'LaTeX 质量档位：draft|std|high|press|cn|screen|slides' },
+  engine: { keys: ['-e', '--engine'], arg: 'NAME', desc: 'LaTeX 引擎：xelatex|lualatex|pdflatex|tectonic' },
+  output: { keys: ['-o', '--output', '--out'], arg: 'FILE', desc: '输出文件（单文件时用；多文件请用 --outdir）' },
+  outdir: { keys: ['-d', '--outdir', '--out-dir'], arg: 'DIR', desc: '输出目录' },
+  name: { keys: ['--name'], arg: 'NAME', desc: '文档基名（配合 --stdin 时必须给）' },
+  jobs: { keys: ['-j', '--jobs'], arg: 'N', desc: '多文件并发数（默认 min(CPU 核数, 4)）' },
+  stdin: { keys: ['--stdin'], arg: '', desc: '从标准输入读 Markdown' },
+  dpi: { keys: ['--dpi'], arg: 'N', desc: 'PNG 分辨率：150 屏幕 / 300 打印 / 600 印刷 / 1200 极致' },
+  card: { keys: ['--card', '--no-card'], arg: '', desc: '分享卡片版式（默认整页长图）' },
+  cardPadding: { keys: ['--card-pad'], arg: 'N', desc: '卡片内边距 px' },
+  transparent: { keys: ['--transparent'], arg: '', desc: '透明背景' },
+  theme: { keys: ['--theme'], arg: 'NAME', desc: '文档主题（mdp themes 看全部）' },
+  width: { keys: ['--width'], arg: 'N', desc: '正文宽度 px（卡片宽度 = 这个值 + 内边距）' },
+  paper: { keys: ['--paper'], arg: 'NAME', desc: 'A4|A5|B5|Letter|Legal|A3' },
+  margin: { keys: ['--margin'], arg: 'N', desc: '页边距 mm' },
+  fontSize: { keys: ['--font-size', '--fontsize-px'], arg: 'N', desc: '正文字号 px' },
+  lineHeight: { keys: ['--line-height'], arg: 'N', desc: '行距倍数' },
+  fontBody: { keys: ['--font'], arg: 'NAME', desc: '正文字体预设' },
+  fontHeading: { keys: ['--heading-font'], arg: 'NAME', desc: '标题字体预设' },
+  codeTheme: { keys: ['--code-theme'], arg: 'NAME', desc: '代码高亮主题' },
+  accent: { keys: ['--accent'], arg: 'COLOR', desc: '主题强调色，如 #6366f1' },
+  title: { keys: ['--title'], arg: 'STR', desc: '文档信息块标题' },
+  author: { keys: ['--author'], arg: 'STR', desc: '文档信息块作者' },
+  date: { keys: ['--date'], arg: 'STR', desc: '文档信息块日期' },
+  showMeta: { keys: ['--no-meta'], arg: '', desc: '不渲染文档信息块' },
+  toc: { keys: ['--toc', '--no-toc'], arg: '', desc: 'LaTeX 路线目录开关' },
+  tocDepth: { keys: ['--toc-depth'], arg: 'N', desc: '目录深度' },
+  tocEmbed: { keys: ['--embed-toc'], arg: '', desc: '正文内嵌目录（HTML 路线）' },
+  numbers: { keys: ['--numbers', '--no-numbers'], arg: '', desc: '章节编号' },
+  numbering: { keys: ['--numbering'], arg: '', desc: '定理 / 引理自动编号' },
+  breaks: { keys: ['--breaks', '--no-breaks'], arg: '', desc: '软换行即换行' },
+  lineNumbers: { keys: ['--line-numbers'], arg: '', desc: '代码块显示行号' },
+  justify: { keys: ['--justify'], arg: '', desc: '两端对齐' },
+  paragraphIndent: { keys: ['--indent'], arg: 'N|STR', desc: '段落首行缩进' },
+  linestretch: { keys: ['--linestretch', '--line-stretch'], arg: 'N', desc: 'LaTeX 行距' },
+  mainfont: { keys: ['--mainfont'], arg: 'NAME', desc: 'LaTeX 主字体（透传 pandoc）' },
+  cjkfont: { keys: ['--cjkfont'], arg: 'NAME', desc: 'CJK 字体（透传 pandoc）' },
+  monofont: { keys: ['--monofont'], arg: 'NAME', desc: '等宽字体（透传 pandoc）' },
+  highlight: { keys: ['--highlight'], arg: 'STYLE', desc: 'pandoc 代码高亮风格' },
+  documentclass: { keys: ['--documentclass'], arg: 'NAME', desc: 'LaTeX documentclass' },
+  classoption: { keys: ['--classoption'], arg: 'STR', desc: 'documentclass 选项（可重复）' },
+  includeHeaders: { keys: ['-H', '--include-in-header'], arg: 'FILE', desc: 'LaTeX 导言区文件（可重复）' },
+  variables: { keys: ['-s', '--var'], arg: 'K=V', desc: 'pandoc 变量（可重复）' },
+  metadata: { keys: ['-M', '--metadata'], arg: 'K=V', desc: 'pandoc 元数据（可重复）' },
+  citeproc: { keys: ['--citeproc'], arg: '', desc: '启用引用处理' },
+  bibliography: { keys: ['--bibliography'], arg: 'FILE', desc: '参考文献库' },
+  csl: { keys: ['--csl'], arg: 'FILE', desc: '引用样式文件' },
+  port: { keys: ['--port'], arg: 'N', desc: '监听端口（默认 8757，被占用时自动向后找）' },
+  host: { keys: ['--host'], arg: 'ADDR', desc: '监听地址（默认 127.0.0.1，只监听回环）' },
+  token: { keys: ['--token'], arg: 'STR', desc: '访问口令；对外暴露时必须给' },
+  open: { keys: ['--no-open', '--open'], arg: '', desc: '是否自动打开浏览器' },
+  python: { keys: ['--python'], arg: '', desc: '用 Python/FastAPI 宿主挂载同一前端（方案 B）' },
+  concurrency: { keys: ['--concurrency'], arg: 'N', desc: '后台同时渲染的任务数（默认 2）' },
+  json: { keys: ['--json'], arg: '', desc: '产物信息以 JSON 输出到 stdout' },
+  dryRun: { keys: ['-n', '--dry-run'], arg: '', desc: '只打印将要执行的命令，不真的渲染' },
+  force: { keys: ['-f', '--force'], arg: '', desc: '忽略缓存' },
+  keep: { keys: ['-k', '--keep', '--keep-pdf'], arg: '', desc: '保留中间 PDF / .tex' },
+  quiet: { keys: ['-Q', '--quiet'], arg: '', desc: '安静模式' },
+  verbose: { keys: ['-v', '--verbose'], arg: '', desc: '详细日志' },
+  extra: { keys: ['--'], arg: '', desc: '其余参数原样交给 pandoc' },
+};
+
+/** 顶部"最常用"速查：分组列出最该记住的参数，避免一上来就一堵墙 */
+const CHEATSHEET = [
+  ['to', 'via', 'dpi', 'card'],
+  ['theme', 'width', 'paper', 'output'],
+  ['outdir', 'quality', 'toc', 'numbers'],
+];
+
+function flagLine(key) {
+  const f = FLAG_HELP[key];
+  if (!f) return null;
+  const keys = f.keys.join(', ');
+  const arg = f.arg ? ` ${f.arg}` : '';
+  return { keys: `${keys}${arg}`, desc: f.desc };
+}
+
+/** `mdp help build` —— 只讲这个命令，而不是把 80 个参数全倒出来 */
+function printCommandHelp(cmdName, showAll = false) {
+  const c = COMMANDS.find((x) => x.name === cmdName);
+  if (!c) return false;
+  const p = (s) => out(s);
+  p('');
+  p(`${bold('mdp ' + c.name)} — ${c.summary}`);
+  p('');
+  p(`${bold('用法')}`);
+  p(`  ${c.usage}`);
+  const aliasNames = c.aliases.filter((a) => !a.startsWith('-'));
+  if (aliasNames.length) p(`  ${dim('别名：')}${aliasNames.join(' / ')}`);
+
+  if (showAll && c.flags.length) {
+    p('');
+    p(`${bold('全部参数')} ${dim(`(${c.flags.length} 项)`)}`);
+    for (const key of c.flags) {
+      const l = flagLine(key);
+      if (l) p(`  ${l.keys.padEnd(30)} ${l.desc}`);
+    }
+  } else if (c.flags.length) {
+    p('');
+    p(`${bold('最该记住的')}`);
+    for (const row of CHEATSHEET) {
+      for (const key of row) {
+        if (!c.flags.includes(key)) continue;
+        const l = flagLine(key);
+        if (l) p(`  ${l.keys.padEnd(30)} ${l.desc}`);
+      }
+      p('');
+    }
+    p(`  ${dim(`全部 ${c.flags.length} 个参数：mdp help ${c.name} --all`)}`);
+  }
+
+  p('');
+  p(`${bold('示例')}`);
+  for (const ex of HELP_EXAMPLES[c.name] || []) p(`  ${ex}`);
+  p('');
+  return true;
+}
+
+const HELP_EXAMPLES = {
+  serve: [
+    'mdp serve                       # 打开 http://127.0.0.1:8757',
+    'mdp serve --port 9000 --no-open # 指定端口、不自动开浏览器',
+    'mdp serve --token 我的口令       # 再上一层口令（对外暴露时用）',
+  ],
+  build: [
+    'mdp build 定理.md -t png --dpi 300 --card --theme ink',
+    'mdp build 论文.md -t pdf -q cn --toc --numbers',
+    'mdp build 讲义.md -t pdf-html --theme academic --paper A4',
+    'mdp build a.md b.md c.md -t png -d ./out -j 4',
+    'cat note.md | mdp build --stdin --name note -t png',
+    'mdp build 论文.md -t png,pdf,html    # 一次出三种',
+  ],
+  doctor: ['mdp doctor', 'mdp doctor --json | jq .summary'],
+  list: ['mdp list', 'mdp list routes', 'mdp list themes', 'mdp list presets --json'],
+  routes: ['mdp routes'],
+  themes: ['mdp themes'],
+  clean: ['mdp clean -n    # 先看会删什么', 'mdp clean'],
+  help: ['mdp help', 'mdp help build'],
+};
 
 function printHelp() {
   const p = (s) => out(s);
   p('');
   p(`${bold('MDP Studio')} ${dim('v' + VERSION)} — Markdown → PNG / TeX-PDF，终端与浏览器双模`);
   p('');
-  p(`${bold('用法')}`);
-  p('  mdp serve [--port 8757] [--no-open]     启动网页工作台（方案 A：Node，零依赖）');
-  p('  mdp serve --python [--port 8757]        方案 B：Python/FastAPI 挂载同一前端');
-  p('  mdp build <文件.md ...> [选项]          直接产出文件，不打开网页');
-  p('  mdp doctor [--json]                     环境体检（pandoc/LaTeX/Chromium/栅格化器）');
-  p('  mdp presets [--json]                    查看质量档位');
-  p('  mdp routes                              查看导出路线');
-  p('  mdp themes                              查看文档主题');
-  p('  mdp clean                               清空 .artifacts 产物目录');
+  p(`${bold('命令')}${dim('（mdp help <命令> 看某一个的完整参数）')}`);
+  let lastGroup = '';
+  for (const c of COMMANDS) {
+    if (c.group !== lastGroup) { p(''); lastGroup = c.group; }
+    p(`  ${bold(c.name.padEnd(8))} ${c.summary}`);
+    const aliasNames = c.aliases.filter((a) => !a.startsWith('-'));
+    if (aliasNames.length) p(`  ${' '.repeat(8)} ${dim('别名：' + aliasNames.join(' / '))}`);
+  }
   p('');
-  p(`${bold('build 选项')}`);
-  p('  -t, --to FORMAT     png | pdf | pdf-html | tex | html | docx | md   (默认 png)');
-  p('      --via ENGINE    html | latex     选产出引擎（png 默认 html，pdf 默认 latex）');
-  p('  -q, --quality LVL   质量档位 draft|std|high|press|cn|screen|slides (LaTeX 路线)');
-  p('  -e, --engine NAME   xelatex|lualatex|pdflatex|tectonic');
-  p('  -o, --output FILE   输出文件        -d, --outdir DIR  输出目录');
-  p('      --name NAME     文档基名（配合 --stdin）');
-  p('  -j, --jobs N        多文件并发数（默认 min(CPU核数, 4)）');
-  p('      --stdin         从标准输入读 Markdown');
+  p(`${bold('最常用的三条')}`);
+  p('  mdp serve                              启动网页工作台');
+  p('  mdp build 论文.md -t pdf -q cn --toc    直接出 PDF');
+  p('  mdp build 定理.md -t png --dpi 300 --card --theme ink');
   p('');
-  p(`  ${dim('— PNG / HTML 路线 —')}`);
-  p('      --dpi N         PNG 分辨率，默认 200（300 打印，600 印刷）');
-  p('      --card / --no-card      分享卡片样式（默认整页）');
-  p('      --card-pad N    卡片内边距 px        --transparent  透明背景');
-  p('      --theme NAME    文档主题（见 mdp themes）');
-  p('      --width N       正文宽度 px          --paper A4|A5|B5|Letter|Legal|A3');
-  p('      --font-size N   正文字号 px          --line-height N');
-  p('      --font NAME     正文字体预设         --code-theme NAME');
-  p('      --accent COLOR  主题强调色');
-  p('      --title/--author/--date STR         文档信息块（--no-meta 关闭）');
-  p('');
-  p(`  ${dim('— Markdown 行为 —')}`);
-  p('      --toc / --no-toc           LaTeX 路线目录开关');
-  p('      --numbers / --no-numbers   章节编号');
-  p('      --numbering                定理/引理自动编号');
-  p('      --breaks                   软换行即换行');
-  p('      --embed-toc                正文内嵌目录（HTML 路线）');
-  p('      --line-numbers             代码块显示行号');
-  p('      --justify                  两端对齐');
-  p('');
-  p(`  ${dim('— 其它 —')}`);
-  p('      --json           把产物信息以 JSON 输出到 stdout');
-  p('  -n, --dry-run        只打印将要执行的命令');
-  p('  -f, --force          忽略缓存');
-  p('  -k, --keep           保留中间 PDF / .tex');
-  p('  -Q, --quiet  -v, --verbose');
-  p('      --               其余参数原样交给 pandoc');
-  p('');
-  p(`${bold('示例')}`);
-  p('  mdp build 定理.md -t png --dpi 300 --card --theme ink --title 极值定理');
-  p('  mdp build 论文.md -t pdf -q cn --toc --numbers');
-  p('  mdp build 讲义.md -t pdf-html --theme academic --paper A4');
-  p('  cat note.md | mdp build --stdin --name note -t png');
-  p('  mdp serve --port 8757        # 然后浏览器里可视化编辑 / 批量导出');
+  p(`${bold('参数速查')}${dim('（完整参数：mdp help build）')}`);
+  for (const key of ['to', 'via', 'quality', 'engine', 'output', 'outdir', 'dpi', 'card', 'theme', 'toc', 'json', 'dryRun']) {
+    const l = flagLine(key);
+    if (l) p(`  ${l.keys.padEnd(28)} ${l.desc}`);
+  }
   p('');
   p(`${dim('等价关系：mdp build … -t pdf 与 md2pdf … 完全一致；md2pdf serve 等价于 mdp serve。')}`);
   p('');
@@ -242,6 +463,29 @@ async function cmdDoctor(o) {
 }
 
 /* ----------------------------------------------------------- presets --- */
+
+/**
+ * `mdp list [presets|routes|themes]`
+ *
+ * 原来只查档位要记 `mdp presets`、查路线要记 `mdp routes`、查主题又要记
+ * `mdp themes` —— 三个近义词分别对应三种资源，纯靠背。现在统一成 `mdp list X`，
+ * 旧名字全部保留为别名；不带参数时一次把三样都列出来，省得猜。
+ */
+async function cmdList(o) {
+  const what = (o._[0] || '').toLowerCase();
+  if (what === 'routes' || what === 'route') return cmdRoutes();
+  if (what === 'themes' || what === 'theme') return cmdThemes();
+  if (what === 'presets' || what === 'preset' || what === 'quality') return cmdPresets(o);
+  if (what) {
+    const guess = closest(what, ['presets', 'routes', 'themes']);
+    fail(`mdp list 不认识 ${what}${guess ? `，你是想输入 ${guess} 吗？` : ''}（可选：presets | routes | themes）`);
+    return 2;
+  }
+  await cmdPresets(o);
+  cmdRoutes();
+  cmdThemes();
+  return 0;
+}
 
 async function cmdPresets(o) {
   const presets = await getPresets({ force: true, onLog: (l, m) => warn(m) });
@@ -386,6 +630,10 @@ async function cmdBuild(o) {
       if (o.keep) argv.push('--keep-pdf');
     }
     if (o.force) argv.push('-f');
+    // -j 必须转发：LaTeX 路线的并发池在 md2pdf 内部，Node 侧从不自己 fan-out
+    // （所有文件都塞进同一次 md2pdf 调用）。不转发的话 `mdp build -j 8 *.md`
+    // 会安安静静地串行跑完 —— 帮助里明明写着 -j 是"多文件并发数"。
+    if (o.jobs) argv.push('-j', String(o.jobs));
     if (o.keep && to === 'pdf') argv.push('-k');
     if (o.toc === true) argv.push('--toc');
     if (o.toc === false) argv.push('--no-toc');
@@ -695,18 +943,40 @@ async function main() {
   const o = parseArgs(rest);
 
   if (o.version || cmd === 'version' || argv.includes('--version')) { out(`${PROG} ${VERSION}`); return 0; }
+
+  /* `mdp help <命令>` = 讲清这一个命令；`mdp help` = 总览。
+     也接受 `mdp --help build` / `mdp build --help` 这两种写法。 */
+  const helpTarget = (cmd === 'help' ? o._[0] : null)
+    || (o.help && o._[0] && COMMAND_ALIAS.has(o._[0]) ? o._[0] : null)
+    || (cmd && o.help ? cmd : null);
+  if (helpTarget) {
+    const resolved = COMMAND_ALIAS.get(helpTarget);
+    const showAll = o.all === true;
+    if (resolved && printCommandHelp(resolved, showAll)) return 0;
+    const guess = closest(helpTarget, [...COMMAND_ALIAS.keys()]);
+    fail(`没有 ${helpTarget} 这个命令${guess ? `，你是想输入 ${guess} 吗？` : ''}`);
+    printHelp();
+    return 2;
+  }
   if (o.help || cmd === 'help' || (!cmd && !argv.length)) { printHelp(); return 0; }
 
-  switch (cmd) {
-    case 'serve': case 'web': case 'studio': return cmdServe(o);
-    case 'build': case 'render': case 'make': return cmdBuild(o);
+  const resolved = COMMAND_ALIAS.get(cmd);
+  switch (resolved) {
+    case 'serve': return cmdServe(o);
+    case 'build': return cmdBuild(o);
     case 'doctor': return cmdDoctor(o);
-    case 'presets': case 'list': return cmdPresets(o);
+    case 'list': return cmdList(o);
     case 'routes': return cmdRoutes();
     case 'themes': return cmdThemes();
     case 'clean': return cmdClean();
+    case 'help': printHelp(); return 0;
     default:
-      if (cmd) { fail(`未知子命令 ${cmd}`); printHelp(); return 2; }
+      if (cmd) {
+        const guess = closest(cmd, [...COMMAND_ALIAS.keys()]);
+        fail(`未知子命令 ${cmd}${guess ? `，你是想输入 ${guess} 吗？` : ''}`);
+        printHelp();
+        return 2;
+      }
       printHelp();
       return 0;
   }

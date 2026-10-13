@@ -38,6 +38,7 @@ export class JobManager {
       type: spec.type || 'render',
       label: spec.label || '',
       status: 'queued',
+      cancelling: false,
       meta: spec.meta || {},
       logs: [],
       logCount: 0,
@@ -112,6 +113,26 @@ export class JobManager {
     return () => job.subscribers.delete(fn);
   }
 
+  /**
+   * 批量取消：按条件挑出还在排队/运行的**渲染**任务并全部取消。
+   *
+   * 用途是"用户又点了一次导出"：新请求必须让旧请求立刻让路，否则后端会同时
+   * 跑多个 TeX/Chromium 子进程（每个都吃几百 MB），几分钟内就把机器拖垮。
+   * 取消走的是 AbortController → 子进程收 SIGTERM，见 server/util.mjs 的 run()。
+   *
+   * @param {(job:object)=>boolean} [predicate] 默认：所有排队/运行中的任务
+   * @returns {string[]} 被取消的任务 id
+   */
+  cancelWhere(predicate) {
+    const cancelled = [];
+    for (const job of this.jobs.values()) {
+      if (job.status !== 'queued' && job.status !== 'running') continue;
+      if (predicate && !predicate(job)) continue;
+      if (this.cancel(job.id)) cancelled.push(job.id);
+    }
+    return cancelled;
+  }
+
   cancel(id) {
     const job = this.jobs.get(id);
     if (!job) return false;
@@ -126,7 +147,11 @@ export class JobManager {
       this.log(job, 'warn', '任务在排队中被取消');
       this.#emit(job, 'state');
     } else {
+      // 立刻打上"正在取消"标记：真正停下要等子进程/浏览器退出（几十到几百毫秒），
+      // 前端需要立刻把按钮切到"取消中"而不是继续显示"运行中"。
+      job.cancelling = true;
       this.log(job, 'warn', '正在取消…（等待当前子进程退出）');
+      this.#emit(job, 'state');
     }
     return true;
   }
@@ -191,12 +216,14 @@ export class JobManager {
       job.stats = result?.stats || null;
       job.toc = result?.toc || null;
       job.workDir = result?.workDir || null;
+      job.cancelling = false;
       job.status = job._cancelRequested ? 'cancelled' : 'done';
       job.progress = 1;
       if (job.status === 'cancelled') this.log(job, 'warn', '任务已取消');
       else this.log(job, 'ok', `完成：${job.artifacts.length} 个产物 · ${Date.now() - t0}ms`);
     } catch (err) {
       const aborted = err?.aborted || job.abort.signal.aborted || job._cancelRequested;
+      job.cancelling = false;
       job.status = aborted ? 'cancelled' : 'error';
       job.error = aborted ? '任务已取消' : (err?.message || String(err));
       job.detail = err?.detail ? String(err.detail).slice(0, 8000) : null;

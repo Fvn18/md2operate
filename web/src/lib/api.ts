@@ -41,10 +41,33 @@ export const api = {
       body: JSON.stringify(settings),
     }),
 
-  render: (payload: Record<string, unknown>) =>
-    req<RenderAccepted>('/api/render', { method: 'POST', body: JSON.stringify(payload) }),
+  render: (payload: Record<string, unknown>, init: { signal?: AbortSignal } = {}) =>
+    req<RenderAccepted>('/api/render', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal: init.signal,
+    }),
 
   cancel: (jobId: string) => req<{ ok: boolean }>(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
+
+  /** 取消所有进行中的渲染任务（看门狗与"换个文档重新导出"用） */
+  cancelAll: () => req<{ ok: boolean; cancelled: string[] }>('/api/jobs/cancel-all', { method: 'POST' }),
+
+  /**
+   * 同步渲染：直接拿二进制（导出 PNG/PDF 的直取路径）。
+   * 传 signal 就能"连点即熔断"——服务端在连接断开时会杀掉对应的渲染子进程。
+   */
+  renderSync: (payload: Record<string, unknown>, opts: { target?: string; download?: boolean; signal?: AbortSignal } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.target) qs.set('target', opts.target);
+    if (opts.download) qs.set('download', '1');
+    return fetch(`/api/render-sync${qs.toString() ? `?${qs}` : ''}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: opts.signal,
+    });
+  },
 
   job: (jobId: string) => req<{ job: Job; logs: LogEntry[] }>(`/api/jobs/${jobId}`),
 

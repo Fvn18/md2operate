@@ -99,6 +99,29 @@ export async function startServer(opts = {}) {
   let baseUrl = '';
 
   const jobs = new JobManager({ concurrency: opts.concurrency ?? 2 });
+  /**
+   * 渲染执行器。默认就是真实渲染管线；`opts.executorOverride` 是给自检脚本用的
+   * 注入点（scripts/verify-cancel.mjs 用假的慢执行器验证"断开 → 杀子进程"这条
+   * 链路，这样在没有 pandoc/LaTeX 的机器上也能跑）。
+   */
+  const executor = typeof opts.executorOverride === 'function'
+    ? opts.executorOverride
+    : (spec, ctx) => executeRender(spec, ctx);
+  /* 注入了假执行器就意味着"不碰真实工具链"，此时环境探测没有意义，
+     直接放行，好让自检脚本在没有 Chromium/pandoc 的机器上也能跑取消链路。 */
+  const checkEnv = async (kind) => {
+    /* 冷启动时 probeCaps() 要真去跑 pandoc/xelatex/chrome 探测，几百毫秒到几秒不等。
+       `preflightDelayMs` 是自检脚本用来把这段窗口拉开的（scripts/verify-cancel.mjs
+       验证"应答还没写出去，客户端就断了"这条路）。 */
+    if (opts.preflightDelayMs) await new Promise((r) => setTimeout(r, opts.preflightDelayMs));
+    if (opts.executorOverride) return { caps: {}, blockers: [], notices: [] };
+    return preflight(kind);
+  };
+
+  /* 怎么判断"客户端已经走了"？
+     不能用 req.destroyed —— 请求体读完那一刻它就已经是 true（Node 的自动销毁），
+     会把所有正常请求误判成断开。res.destroyed / socket.destroyed 才是真的掉了。 */
+  const clientDisconnected = (res) => res.destroyed === true || res.socket?.destroyed === true;
 
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -371,9 +394,18 @@ export async function startServer(opts = {}) {
     if (p === '/api/render' && req.method === 'POST') {
       const body = await readJson(req, 64 * 1024 * 1024);
       const spec = normalizeRequest(body);
+
+      /* 「新导出顶掉旧导出」在服务端也兜一层：前端已经会显式 cancel 上一个任务，
+         但如果那次 cancel 没送到（页面刷新、连接抖动），这里保证不会堆积。
+         每个 LaTeX/Chromium 子进程都吃几百 MB，堆 3 个就能把机器拖死。 */
+      if (body.supersede === true) {
+        const killed = jobs.cancelWhere((j) => j.type === 'render' || j.type === 'render-sync');
+        if (killed.length) log('warn', `supersede：已取消 ${killed.length} 个进行中的渲染任务`);
+      }
+
       const target = spec.targets[0];
       const targetKind = target === 'png' && spec.png.engine === 'latex' ? 'png-latex' : target;
-      const pre = await preflight(targetKind);
+      const pre = await checkEnv(targetKind);
       if (pre.blockers.length) {
         sendJson(res, 409, {
           error: '环境不具备该导出路线的条件',
@@ -385,14 +417,34 @@ export async function startServer(opts = {}) {
         type: 'render',
         label: `${spec.filename} → ${spec.targets.join(' + ')}`,
         meta: { targets: spec.targets, filename: spec.filename },
-        executor: (ctx) => executeRender(spec, {
+        executor: (ctx) => executor(spec, {
           ...ctx,
           chromePool,
           baseUrl,
           keepWorkDir: body.keepWorkDir === true,
         }),
       });
+
+      /* 应答还没写完就断了（用户连点导出 / 关页面 / AbortController.abort()）：
+         必须把这个任务取消，否则它会在后台继续跑 TeX、Chromium 子进程。
+
+         注意这里有两个时机：
+           · 断开发生在 preflight 等异步准备阶段 —— 监听器还没挂上，close 事件已经
+             过去了，所以先看连接是不是已经死了（下面这行 if）；
+           · 断开发生在应答途中 —— 由 close 监听器兜住。 */
+      if (clientDisconnected(res)) {
+        jobs.cancel(job.id);
+        log('warn', `客户端在建任务前就已断开 → 已取消任务 ${job.id}`);
+        return;
+      }
+      let responded = false;
+      res.on('close', () => {
+        if (responded) return;
+        responded = true;
+        if (jobs.cancel(job.id)) log('warn', `客户端在应答前断开 → 已取消任务 ${job.id}`);
+      });
       sendJson(res, 202, { jobId: job.id, status: job.status, targets: spec.targets, commands: buildPlanPreview(spec) });
+      responded = true;
       return;
     }
 
@@ -403,7 +455,7 @@ export async function startServer(opts = {}) {
       if (url.searchParams.get('target')) spec.targets = [url.searchParams.get('target')];
       const target = spec.targets[0];
       const targetKind = target === 'png' && spec.png.engine === 'latex' ? 'png-latex' : target;
-      const pre = await preflight(targetKind);
+      const pre = await checkEnv(targetKind);
       if (pre.blockers.length) {
         sendJson(res, 409, { error: '环境不具备条件', blockers: pre.blockers });
         return;
@@ -411,10 +463,22 @@ export async function startServer(opts = {}) {
       const job = jobs.create({
         type: 'render-sync',
         label: `${spec.filename} → ${spec.targets.join(' + ')}`,
-        executor: (ctx) => executeRender(spec, { ...ctx, chromePool, baseUrl }),
+        executor: (ctx) => executor(spec, { ...ctx, chromePool, baseUrl }),
       });
       const timeoutMs = Math.max(5000, Math.min(900_000, Number(url.searchParams.get('timeout')) || 300_000));
+
+      /* 同步接口最容易被"连点"打爆：每次点击都真的起一个 Chromium 进程。
+         客户端一旦断开（fetch abort / 关页面），这里立刻中止任务 → 子进程收 SIGTERM。 */
+      let clientGone = clientDisconnected(res);
+      if (clientGone) jobs.cancel(job.id);
+      res.on('close', () => {
+        if (res.writableFinished) return;      // 正常写完，不算断开
+        clientGone = true;
+        if (jobs.cancel(job.id)) log('warn', `同步渲染的客户端已断开 → 已取消任务 ${job.id}`);
+      });
+
       const finished = await jobs.waitFor(job.id, timeoutMs);
+      if (clientGone) return;                  // 客户端已走，不必再写响应
       if (!finished || finished.status === 'queued' || finished.status === 'running') {
         sendError(res, 504, '渲染超时，任务仍在后台运行', `jobId=${job.id}`);
         return;
@@ -442,6 +506,14 @@ export async function startServer(opts = {}) {
     /* ---- 任务 ---- */
     if (p === '/api/jobs' && req.method === 'GET') {
       sendJson(res, 200, { jobs: jobs.list(Number(url.searchParams.get('limit')) || 50), stats: jobs.stats() });
+      return;
+    }
+
+    /* ---- 批量取消：前端"新请求顶掉旧请求"的第二道保险 ---- */
+    if (p === '/api/jobs/cancel-all' && req.method === 'POST') {
+      const cancelled = jobs.cancelWhere();
+      if (cancelled.length) log('warn', `已取消 ${cancelled.length} 个进行中的任务`);
+      sendJson(res, 200, { ok: true, cancelled });
       return;
     }
 

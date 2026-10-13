@@ -181,22 +181,58 @@ export async function probeCaps(opts = {}) {
   return cache;
 }
 
+/**
+ * 各导出路线**真正**的依赖。
+ *
+ * 这里必须按路线判断，不能"一刀切要 pandoc"：HTML 路线（HTML / PDF-html /
+ * HTML 引擎的 PNG）用的是 `shared/markdown.mjs` + Chromium，一个 pandoc 都不需要。
+ * 之前写成全局硬性依赖，导致"没装 pandoc 就整个不能出图"——而这恰恰是本项目
+ * 主打的即点即得路线（也让客户端快速导出找不到服务端兜底）。
+ */
+const ROUTE_DEPS = {
+  // HTML 路线：只依赖 Chromium
+  png: { chrome: true },
+  html: { chrome: true },
+  'pdf-html': { chrome: true },
+  // LaTeX 路线：pandoc + md2pdf 脚本（+ LaTeX 引擎，见下）
+  pdf: { pandoc: true, md2pdf: true, latex: true },
+  tex: { pandoc: true, md2pdf: true },
+  docx: { pandoc: true, md2pdf: true },
+  md: { pandoc: true, md2pdf: true },
+  'png-latex': { pandoc: true, md2pdf: true, latex: true },
+};
+
+/** 路线缺某依赖时的文案（id 与 caps 的检查 id 对齐，前端「体检」面板可直接跳转）。 */
+const DEP_META = {
+  pandoc: { message: '未找到 pandoc，无法走 LaTeX/文档转换路线', hint: 'brew install pandoc' },
+  md2pdf: { message: 'md2pdf 脚本不可用', hint: '检查 md2pdf 权限' },
+  latex: { message: '未找到 LaTeX 引擎，无法生成 TeX 级 PDF', hint: 'brew install --cask mactex-no-gui' },
+  chrome: { message: '未找到 Chromium/Chrome，HTML 路线不可用', hint: '设置 MDP_CHROME 或安装 Chrome' },
+};
+
 /** 渲染前的硬性预检：返回阻止渲染的原因数组。 */
 export async function preflight(target) {
   const caps = await probeCaps();
   const blockers = [];
-  if (!caps.engines.pandoc.found) blockers.push({ id: 'pandoc', message: '未找到 pandoc，无法渲染任何格式', hint: 'brew install pandoc' });
+  const deps = ROUTE_DEPS[target] || {};
 
-  if (target === 'pdf' || target === 'png-latex' || target === 'tex') {
-    if (!caps.md2pdf) blockers.push({ id: 'md2pdf', message: 'md2pdf 脚本不可用', hint: '检查 md2pdf 权限' });
+  for (const dep of Object.keys(DEP_META)) {
+    if (!deps[dep]) continue;
+    const ok = dep === 'pandoc' ? caps.engines.pandoc.found
+      // md2pdf 的可用性只存在于 checks 表里（缓存对象上没有 md2pdf 字段）。
+      // 曾经写成 Boolean(caps.md2pdf) → 恒为 false → 凡是声明了 md2pdf 的路线
+      // （pdf / tex / docx / md / png-latex）全部被 409 拦死，而 doctor 却显示 ok。
+      : dep === 'md2pdf' ? caps.checks.some((c) => c.id === 'md2pdf' && c.status === 'ok')
+        : dep === 'latex' ? caps.engines.latexOrder.length > 0
+          : caps.chrome.found;
+    if (!ok) blockers.push({ id: dep, ...DEP_META[dep] });
   }
-  if (target === 'pdf' || target === 'png-latex') {
-    if (!caps.engines.latexOrder.length) blockers.push({ id: 'latex', message: '未找到 LaTeX 引擎，无法生成 TeX 级 PDF', hint: 'brew install --cask mactex-no-gui' });
+  // 不阻塞，但要把"哪些能力因此不可用"讲清楚，避免用户以为程序坏了
+  const notices = [];
+  if (!caps.engines.pandoc.found && !deps.pandoc) {
+    notices.push('缺少 pandoc：HTML / PNG(HTML 引擎) 路线不受影响，PDF / TeX / Word 路线不可用');
   }
-  if (target === 'png' || target === 'pdf-html') {
-    if (!caps.chrome.found) blockers.push({ id: 'chrome', message: '未找到 Chromium/Chrome，HTML 路线不可用', hint: '设置 MDP_CHROME 或安装 Chrome' });
-  }
-  return { caps, blockers };
+  return { caps, blockers, notices };
 }
 
 export function invalidateCaps() { cache = null; cacheAt = 0; }

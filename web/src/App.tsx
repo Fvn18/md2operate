@@ -8,9 +8,10 @@ import { api, buildPayload, subscribeJob } from './lib/api';
 import { parseCommand } from './lib/commandbar';
 import { getContent as getContentStore, subscribeContent } from './lib/content';
 import { usePreviewState, subscribePreviewState, getPreviewState } from './lib/preview-state';
+import { usePersistStatus } from './lib/persist';
 import { useCursor } from './lib/cursor';
 import { aiApi } from './lib/ai';
-import type { AiStatus, CapsResponse, Job, LogEntry, MetaResponse } from './lib/types';
+import type { AiStatus, CapsResponse, Job, LogEntry, MetaResponse, RenderSettings, Target } from './lib/types';
 import { Icon } from './components/Icons';
 import TopBar from './components/TopBar';
 import SidePanel from './components/SidePanel';
@@ -81,6 +82,7 @@ function StatusBar({ job, caps, artifacts }: {
   // 否则每次按键都会重渲染整棵目录（实测 +16ms/键）。
   const { stats, errors, metrics } = usePreviewState();
   const cursor = useCursor();
+  const persist = usePersistStatus();
   const running = job?.status === 'running' || job?.status === 'queued';
   return (
     <footer className="statusbar">
@@ -94,13 +96,21 @@ function StatusBar({ job, caps, artifacts }: {
       <span className="sep">|</span>
       <span>Ln {cursor.line}, Col {cursor.col}</span>
       <span className="sep">|</span>
-      <span title="预览增量渲染：本次重渲块数 / 总块数 · 耗时">
-        增量 {metrics.rendered}/{metrics.blocks} · {metrics.ms}ms
+      <span title={`预览渲染（${metrics.engine === 'worker' ? 'Web Worker' : '主线程'}）：本次重渲 ${metrics.rendered} 块 / 复用 ${metrics.reused} 块 / 共 ${metrics.blocks} 块\n`
+        + `引擎耗时 ${metrics.ms}ms · 端到端 ${metrics.latencyMs ?? 0}ms · 差量 ${((metrics.deltaBytes ?? 0) / 1024).toFixed(1)}KB / 全量 ${((metrics.fullBytes ?? 0) / 1024).toFixed(1)}KB`}>
+        {metrics.engine === 'worker' ? 'Worker' : '主线程'} 增量 {metrics.rendered}/{metrics.blocks} · {metrics.ms}ms
       </span>
       <span className="grow" />
       <span>{settings.targets.join('+')} · {settings.filename}</span>
       <span className="sep">|</span>
-      <span>{caps ? `pandoc ${caps.engines.pandoc.version?.replace(/^pandoc\s*/, '') || '?'}` : '…'}</span>
+      <span title={persist.mode === 'indexeddb'
+        ? `文档正文存在 ${persist.store}（无 5MB 上限、异步写、不阻塞输入）${persist.degradedReason ? `\n注意：${persist.degradedReason}` : ''}`
+        : `已降级到 localStorage：${persist.degradedReason || 'IndexedDB 不可用'}\n小文档不受影响，大文档请检查浏览器隐私设置`}
+        style={{ color: persist.mode === 'indexeddb' ? undefined : 'var(--warn)' }}>
+        {persist.mode === 'indexeddb' ? 'IndexedDB' : 'localStorage（降级）'}
+      </span>
+      <span className="sep">|</span>
+      <span>{caps ? `pandoc ${caps.engines.pandoc.version?.replace(/^pandoc\s+/, '') || '?'}` : '…'}</span>
       <span className="sep">|</span>
       <span>{caps?.chrome.found ? 'chromium ✓' : 'chromium ✗'}</span>
       <span className="sep">|</span>
@@ -122,6 +132,7 @@ function Studio() {
   const previewRef = useRef<PreviewPaneHandle>(null);
   const unsubRef = useRef<(() => void) | null>(null);
   const syncingRef = useRef(false);
+  const workAreaRef = useRef<HTMLDivElement | null>(null);
 
   const [meta, setMeta] = useState<MetaResponse | null>(null);
   const [caps, setCaps] = useState<CapsResponse | null>(null);
@@ -139,6 +150,17 @@ function Studio() {
   const aiRef = useRef<AiToolbarHandle>(null);
   /** 上一次成功的渲染请求：失败后"重试"直接重放它，不依赖当前编辑器状态 */
   const lastPayloadRef = useRef<Record<string, unknown> | null>(null);
+  /**
+   * 请求熔断（企业级防雪崩）：
+   *   · submitRef  —— 正在提交中的那次 POST，新的一次提交前先 abort 它，避免
+   *                   串行的重复任务；
+   *   · jobIdRef    —— 正在后端跑的渲染任务，新任务发起前显式 cancel，让后端
+   *                   立刻 SIGTERM 掉 TeX/Chromium 子进程（否则连点三次就有
+   *                   三个 Chromium 各吃几百 MB）。
+   */
+  const submitRef = useRef<AbortController | null>(null);
+  const jobIdRef = useRef<string | null>(null);
+  jobIdRef.current = jobId;
 
   const busy = Boolean(jobId && (job?.status === 'running' || job?.status === 'queued'));
 
@@ -237,27 +259,61 @@ function Studio() {
   useEffect(() => () => { unsubRef.current?.(); }, []);
 
   /* ------------------------------------------------------------ 渲染 -- */
-  const doRender = useCallback(async () => {
+  /**
+   * 提交渲染。
+   *
+   * `override` 支持"只这一次"覆盖导出路线（快捷导出用）。关键在于**不写回设置**：
+   * 用户点一次「分享长图」不应该把他面板里精心配好的多选路线改掉。
+   */
+  const doRender = useCallback(async (override?: {
+    targets?: Target[];
+    png?: Partial<RenderSettings['png']>;
+    doc?: Partial<RenderSettings['doc']>;
+  }) => {
     if (!activeDoc) return;
-    if (!settings.targets.length) { pushToast('warn', '没有选择导出目标'); patchUi({ showExport: true, drawerTab: 'output' }); return; }
+    const targets = override?.targets?.length ? override.targets : settings.targets;
+    if (!targets.length) { pushToast('warn', '没有选择导出目标'); patchUi({ showExport: true, drawerTab: 'output' }); return; }
+
+    // ---- 熔断：先掐掉上一次提交与上一次任务，再发新的 ----
+    if (submitRef.current) {
+      submitRef.current.abort();
+      submitRef.current = null;
+    }
+    const previousJob = jobIdRef.current;
+    if (previousJob) {
+      api.cancel(previousJob).catch(() => { /* 任务可能刚好结束了 */ });
+      pushToast('info', '已中止上一次导出', '新的导出优先');
+    }
     setLogs([]);
     setCommands([]);
     try {
-      const payload = buildPayload(getContentStore(), settings, { assetBase: activeDoc.dir });
+      // 快捷导出只改这一次请求，不动 settings
+      const effective: RenderSettings = {
+        ...settings,
+        targets,
+        png: { ...settings.png, ...override?.png },
+        doc: { ...settings.doc, ...override?.doc },
+      };
+      const payload = buildPayload(getContentStore(), effective, { assetBase: activeDoc.dir });
       lastPayloadRef.current = payload;
-      const res = await api.render(payload);
+      const controller = new AbortController();
+      submitRef.current = controller;
+      // supersede：服务端再兜一层，防止上一次的 cancel 在半路丢了
+      const res = await api.render({ ...payload, supersede: true }, { signal: controller.signal });
+      submitRef.current = null;
       setCommands(res.commands || []);
       setJob({
-        id: res.jobId, type: 'render', label: `${settings.filename} → ${settings.targets.join(' + ')}`,
+        id: res.jobId, type: 'render', label: `${settings.filename} → ${targets.join(' + ')}`,
         status: res.status, artifacts: [], warnings: [], errors: [], commands: res.commands || [],
         stats: null, toc: null, createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
-        elapsedMs: null, error: null, detail: null, queuePosition: 0, logCount: 0,
+        elapsedMs: null, error: null, detail: null, queuePosition: 0, logCount: 0, progress: 0,
       });
       setJobId(res.jobId);
       attachJob(res.jobId);
       patchUi({ showConsole: true });
     } catch (err) {
       const e = err as Error & { blockers?: Array<{ message: string; hint?: string }>; detail?: string };
+      if (e.name === 'AbortError') return;   // 被新的一次导出顶掉，不是错误
       if (e.blockers?.length) {
         pushToast('err', '环境不具备该导出条件', e.blockers.map((b) => `${b.message}${b.hint ? `（${b.hint}）` : ''}`).join('；'));
         setLogs((prev) => [...prev,
@@ -277,7 +333,7 @@ function Studio() {
     setLogs([]);
     setCommands([]);
     try {
-      const res = await api.render(payload);
+      const res = await api.render({ ...(payload as Record<string, unknown>), supersede: true });
       setCommands(res.commands || []);
       setJob({
         id: res.jobId, type: 'render', label: `${settings.filename} → ${settings.targets.join(' + ')}`,
@@ -309,23 +365,31 @@ function Studio() {
    * 目录项从预览派生总线读取（不再经 App state）。
    */
   const jumpTo = useCallback((id: string) => {
-    const container = previewScrollRef.current;
-    if (container) {
-      const el = container.querySelector(`#${CSS.escape(id)}`) as HTMLElement | null;
-      if (el) {
-        const top = el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop - 20;
-        syncingRef.current = true;
-        container.scrollTo({ top, behavior: 'smooth' });
-        setTimeout(() => { syncingRef.current = false; }, 320);
-      }
-    }
     const item = tocRef.current.find((t) => t.id === id);
+    let line = -1;
     if (item) {
       const lines = getContentStore().split('\n');
       const needle = item.text.trim();
       const idx = lines.findIndex((l) => l.replace(/^#{1,6}\s*/, '').replace(/\s*\{#[^}]*\}\s*$/, '').trim() === needle);
-      if (idx >= 0) editorRef.current?.scrollToLine(idx + 1);
+      if (idx >= 0) line = idx + 1;
     }
+    /* 预览侧走偏移表跳转：虚拟化下目标块很可能没挂载，DOM 里根本找不到那个锚点。
+       先按行号定位（会顺带把它挂起来），再对已挂载的元素做一次平滑微调。 */
+    if (line > 0) {
+      syncingRef.current = true;
+      syncLock.current = { dir: 'editor', until: performance.now() + 400 };
+      previewRef.current?.scrollToLine(line, 20);
+      const container = previewScrollRef.current;
+      if (container) {
+        const el = container.querySelector(`#${CSS.escape(id)}`) as HTMLElement | null;
+        if (el) {
+          const top = el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop - 20;
+          container.scrollTo({ top, behavior: 'smooth' });
+        }
+      }
+      window.setTimeout(() => { syncingRef.current = false; }, 360);
+    }
+    if (line > 0) editorRef.current?.scrollToLine(line);
   }, []);
 
   /* ------------------------------------------------------------ 导入 -- */
@@ -422,11 +486,16 @@ function Studio() {
        ratio —— 老的按比例方式，保留给"我就想大致跟着"的场景。 */
   const syncModeRef = useRef(ui.scrollSync);
   syncModeRef.current = ui.scrollSync;
+  /* 双向同步的"防打架"锁：谁先动谁说了算，180ms 内不让另一边反过来拽。
+     没有它就会看到经典的抖动——编辑器滚一下把预览拽过去，预览的 scroll 事件
+     又把编辑器拽回来，两边来回跳。 */
+  const syncLock = useRef<{ dir: 'editor' | 'preview' | null; until: number }>({ dir: null, until: 0 });
 
   const onEditorScroll = useCallback((ratio: number, topLine: number) => {
     if (syncingRef.current) return;
     const mode = syncModeRef.current;
     if (mode === 'off') return;
+    syncLock.current = { dir: 'editor', until: performance.now() + 180 };
 
     if (mode === 'anchor') {
       previewRef.current?.scrollToLine(topLine || 1);
@@ -439,6 +508,37 @@ function Studio() {
     syncingRef.current = true;
     el.scrollTop = ratio * max;
     window.setTimeout(() => { syncingRef.current = false; }, 60);
+  }, []);
+
+  /* ---- 预览 → 编辑器（反向同步） ----------------------------------------
+     设计文档要求"双向插值锚定"：编辑器滚到某行，预览跟着；预览滚到某处，
+     编辑器也要跟到**同一行**（不是同一比例）。这里把视口顶部像素反解成
+     行号 + 行内比例（yToLine），再用静默滚动落到编辑器——不抢焦点、不动光标，
+     所以用户可以一边看预览一边继续打字。 */
+  useEffect(() => {
+    const el = previewScrollRef.current;
+    if (!el) return undefined;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (syncingRef.current) return;
+        const mode = syncModeRef.current;
+        if (mode !== 'anchor') return;                       // 只有锚定模式做双向
+        const now = performance.now();
+        if (syncLock.current.dir === 'editor' && now < syncLock.current.until) return;
+        const hit = previewRef.current?.topLine();
+        if (!hit) return;
+        syncLock.current = { dir: 'preview', until: now + 180 };
+        editorRef.current?.scrollToLineQuiet(hit.line, hit.frac);
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, []);
 
   const cleanup = useCallback(() => {
@@ -478,25 +578,39 @@ function Studio() {
           <Splitter orientation="v" onDelta={(d) => patchUi({ sideWidth: Math.max(200, Math.min(480, ui.sideWidth + d)) })} />
         )}
 
-        <EditorPane
-          ref={editorRef}
-          onSave={() => { flushContent(); saveNow(); pushToast('info', '已保存到浏览器本地'); }}
-          onRender={doRender}
-          onScroll={onEditorScroll}
-          onFlush={flushContent}
-          onCaretLine={(line) => {
-            if (syncModeRef.current === 'anchor') previewRef.current?.revealLine(line);
-          }}
-        />
+        <div
+          ref={workAreaRef}
+          className="work-area"
+          data-preview={ui.showPreview ? '1' : '0'}
+        >
+          <div className="work-editor" style={{ flexBasis: ui.showPreview ? `${ui.splitRatio * 100}%` : '100%' }}>
+            <EditorPane
+              ref={editorRef}
+              onSave={() => { flushContent(); saveNow(); pushToast('info', '已保存到浏览器本地'); }}
+              onRender={doRender}
+              onScroll={onEditorScroll}
+              onFlush={flushContent}
+              onCaretLine={(line) => {
+                if (syncModeRef.current === 'anchor') previewRef.current?.revealLine(line);
+              }}
+            />
+          </div>
 
-        {ui.showPreview && (
-          <>
-            <Splitter orientation="v" onDelta={() => { /* 预览宽度由内容决定；拖动改正文宽度 */ }} />
-            <div style={{ display: 'flex', flex: 1, minWidth: 0, borderLeft: '1px solid var(--border)' }}>
-              <PreviewPane ref={previewRef} scrollRef={previewScrollRef} />
-            </div>
-          </>
-        )}
+          {ui.showPreview && (
+            <>
+              <Splitter
+                orientation="v"
+                onDelta={(d) => {
+                  const w = workAreaRef.current?.clientWidth || 1;
+                  patchUi({ splitRatio: Math.max(0.2, Math.min(0.8, ui.splitRatio + d / w)) });
+                }}
+              />
+              <div className="work-preview">
+                <PreviewPane ref={previewRef} scrollRef={previewScrollRef} />
+              </div>
+            </>
+          )}
+        </div>
 
         {ui.showExport && (
           <>

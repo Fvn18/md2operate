@@ -58,6 +58,10 @@ const P: Record<string, React.ReactNode> = {
   history: <><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /><path d="M12 8v4.5l3 1.8" /></>,
   split: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M12 4v16" /></>,
   sparkle: <><path d="M12 3l1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6z" /></>,
+  // 渲染引擎 / 性能 / 离线 三枚图标（Worker 渲染、SLO 面板、PWA 状态用）
+  cpu: <><rect x="7" y="7" width="10" height="10" rx="2" /><rect x="3.5" y="3.5" width="17" height="17" rx="3" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /></>,
+  gauge: <><path d="M4 18a9 9 0 1 1 16 0" /><path d="M12 14l4-3.5" /><circle cx="12" cy="15" r="1.4" /></>,
+  offline: <><path d="M3 3l18 18" /><path d="M5 18h9" /><path d="M8.5 14.5a6 6 0 0 1 4-1.4" /><path d="M13 6.3a9 9 0 0 1 6.7 3.2" /><path d="M4.3 9.5A9 9 0 0 1 8 7" /></>,
 };
 
 export type IconName = keyof typeof P;

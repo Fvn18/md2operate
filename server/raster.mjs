@@ -90,14 +90,14 @@ export function bestRasterizer() {
 /**
  * 把 PDF 的指定页渲染为 PNG。
  * @param {{pdfPath:string, outPath:string, dpi?:number, page?:number, transparent?:boolean, timeoutMs?:number,
- *          onLog?:(stream:'out'|'err',line:string)=>void}} o
+ *          signal?:AbortSignal, onLog?:(stream:'out'|'err',line:string)=>void}} o
  * @returns {Promise<{ok:boolean, tool?:string, quality?:string, warning?:string, error?:string,
  *                    width?:number, height?:number, bytes?:number, command?:string}>}
  */
 export async function pdfToPng(o) {
   const {
     pdfPath, outPath, dpi = 200, page = 1, transparent = false,
-    timeoutMs = 120000, onLog,
+    timeoutMs = 120000, onLog, signal,
   } = o;
 
   const tools = detectRasterizers();
@@ -117,7 +117,8 @@ export async function pdfToPng(o) {
   const errors = [];
 
   for (const tool of tools) {
-    const result = await runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutMs, onLog });
+    if (signal?.aborted) return { ok: false, error: '任务已取消' };
+    const result = await runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutMs, onLog, signal });
     if (result.ok) return result;
     errors.push(`[${tool.id}] ${result.error}`);
   }
@@ -125,7 +126,7 @@ export async function pdfToPng(o) {
   return { ok: false, error: `所有栅格化后端均失败：\n${errors.join('\n')}` };
 }
 
-async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutMs, onLog }) {
+async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutMs, onLog, signal }) {
   const d = Math.max(36, Math.min(1200, Math.round(dpi)));
   try { await fsp.rm(outPath, { force: true }); } catch { /* ignore */ }
   const outBase = outPath.replace(/\.png$/i, '');
@@ -133,6 +134,12 @@ async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutM
   let args;
   let produced = outPath;
   let warning = null;
+  /* sips 分支自己就把活干完了（它要跑两次：先出图、再重采样放大），不能再落到
+     下面那句共用的 run(cmd, args) —— 它没有 args，会以空参数再跑一次 sips，
+     最后在拼 command 字符串时 `args.join` 抛 TypeError 把整个请求打崩。
+     曾经因为 gs 分支也坏着（见上），sips 才是实际被选中的那一支，所以这个崩溃
+     一直没暴露：gs 一修好，它就被永久藏起来了。 */
+  let ran = false;
 
   switch (tool.id) {
     case 'pdftoppm':
@@ -151,8 +158,14 @@ async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutM
       cmd = tool.path;
       args = [
         '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
-        '-sDEVICE', transparent ? 'pngalpha' : 'png16m',
-        '-r', String(d),
+        // Ghostscript ≥10 要求带值的选项必须**贴成一个 argv 元素**：
+        //   '-sDEVICE', 'png16m'  → "Unknown device: "（名字空）
+        //   '-r', '200'           → "-r must be followed by <res>"
+        // 两者都是 exit=1 且不产出文件。分开写是老版本的习惯，新版本一律拒绝。
+        // 注意 poppler(pdftoppm/pdftocairo) 与 mutool 不受影响 —— 它们接受分开写，
+        // 所以下面几支保持原样，只有 gs 这一支必须贴。
+        '-sDEVICE=' + (transparent ? 'pngalpha' : 'png16m'),
+        '-r' + String(d),
         '-dFirstPage=' + page, '-dLastPage=' + page,
         '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4',
         `-sOutputFile=${outPath}`, pdfPath,
@@ -166,7 +179,7 @@ async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutM
       cmd = tool.path;
       // sips 只能按 PDF 的 72dpi 用户空间出图，再靠重采样放大——纯降级方案
       const tmp = path.join(TMP_DIR, `sips-${uid(8)}.png`);
-      const first = await run(cmd, ['-s', 'format', 'png', pdfPath, '--out', tmp], { timeoutMs, onLog });
+      const first = await run(cmd, ['-s', 'format', 'png', pdfPath, '--out', tmp], { timeoutMs, onLog, signal });
       if (first.code !== 0) {
         return { ok: false, error: (first.stderr || first.stdout || 'sips 转换失败').trim().slice(0, 400) };
       }
@@ -175,7 +188,7 @@ async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutM
       if (!size) { await fsp.rm(tmp, { force: true }); return { ok: false, error: 'sips 未产出有效 PNG' }; }
       const want = Math.round((size.width * d) / 72);
       if (want > size.width) {
-        const up = await run(cmd, ['--resampleWidth', String(want), tmp], { timeoutMs: 60000, onLog });
+        const up = await run(cmd, ['--resampleWidth', String(want), tmp], { timeoutMs: 60000, onLog, signal });
         if (up.code !== 0) warning = 'sips 放大失败，已保留 72dpi 原图';
       }
       await fsp.rename(tmp, outPath).catch(async () => {
@@ -187,15 +200,20 @@ async function runOne(tool, { pdfPath, outPath, dpi, page, transparent, timeoutM
         warning = `已降级使用 macOS 内置 sips（实际渲染 72dpi → 放大到 ${want}px 宽），文字边缘会偏软。建议 brew install poppler 以获得真正的高清输出。`;
       }
       produced = outPath;
+      // 只用于报告（command 字段），真正的执行已经在上面做完了
+      args = ['-s', 'format', 'png', pdfPath, '--out', outPath];
+      ran = true;
       break;
     }
     default:
       return { ok: false, error: '未知工具' };
   }
 
-  const res = await run(cmd, args, { timeoutMs, onLog });
-  if (res.code !== 0) {
-    return { ok: false, error: (res.stderr || res.stdout || `退出码 ${res.code}`).trim().slice(0, 500) };
+  if (!ran) {
+    const res = await run(cmd, args, { timeoutMs, onLog, signal });
+    if (res.code !== 0) {
+      return { ok: false, error: (res.stderr || res.stdout || `退出码 ${res.code}`).trim().slice(0, 500) };
+    }
   }
   const st = await fsp.stat(produced).catch(() => null);
   if (!st || st.size === 0) return { ok: false, error: '工具执行成功但没有产出文件' };

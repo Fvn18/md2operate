@@ -21,10 +21,21 @@ export interface RenderError {
 
 export interface PreviewMetrics {
   mode: string;
+  /** 引擎渲染耗时（解析 + KaTeX 排版） */
   ms: number;
   blocks: number;
+  /** 复用的块数（未变更，DOM 完全不动） */
   reused: number;
+  /** 重渲的块数（差量里真正传输与替换的块） */
   rendered: number;
+  /** 端到端延迟：输入 → 结果回到主线程（含排队与传输） */
+  latencyMs?: number;
+  /** 差量传输字节 / 全量 HTML 字节 */
+  deltaBytes?: number;
+  fullBytes?: number;
+  /** 'worker' | 'main' —— 渲染跑在哪条线程上 */
+  engine?: 'worker' | 'main';
+  coalesced?: number;
 }
 
 export interface PreviewState {
@@ -90,6 +101,8 @@ export function publishStats(
     && stats.words === state.stats.words
     && metrics.ms === state.metrics.ms
     && metrics.reused === state.metrics.reused
+    && metrics.engine === state.metrics.engine
+    && metrics.latencyMs === state.metrics.latencyMs
   ) {
     state = { ...state, stats, metrics };
     return;

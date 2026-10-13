@@ -18,6 +18,14 @@
  *   node scripts/bench.mjs --chars 300000
  *   node scripts/bench.mjs --json bench.json   # 落盘，便于前后 diff
  *   node scripts/bench.mjs --baseline bench.baseline.json   # 与基线对比
+ *   node scripts/bench.mjs --viewport 1400x900 # 固定窗口尺寸（scrollFps 需要它）
+ *
+ * 关于 --viewport：`scrollFps` 的一项不是"帧率"而是"2 秒内能挂载多少块"，而它由
+ * 预览面板的宽度间接决定 —— 面板越窄，fit 缩放越小，可见的**布局像素**反而越多，
+ * 虚拟化要挂的块就越多。默认窗口 800x600 下，默认打开的导出抽屉会把预览压到
+ * 50 多像素宽（scale≈0.02），于是整篇 11 万像素高的文档被塞进 2600 像素的滚动区，
+ * 2 秒内要遍历全部 1151 块 —— 测出来的是最坏情况，不是日常体验。
+ * 因此对比历史数字时**必须同时固定窗口尺寸**，否则数字没有可比性。
  */
 
 import fsp from 'node:fs/promises';
@@ -49,6 +57,11 @@ const KEYSTROKES = Number(arg('keys', 30));
 const JSON_OUT = arg('json', '');
 const BASELINE = arg('baseline', '');
 const QUIET = flag('quiet');
+/** 窗口尺寸 WxH；不传则用 Chromium 默认（800x600）。 */
+const VIEWPORT = (() => {
+  const m = /^(\d+)x(\d+)$/i.exec(String(arg('viewport', '')));
+  return m ? [Number(m[1]), Number(m[2])] : null;
+})();
 
 const C = process.stdout.isTTY
   ? { g: (s) => `\x1b[32m${s}\x1b[0m`, r: (s) => `\x1b[31m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, d: (s) => `\x1b[2m${s}\x1b[0m`, b: (s) => `\x1b[1m${s}\x1b[0m` }
@@ -74,7 +87,13 @@ function stats(nums) {
 /* -------------------------------------------------------------- 主流程 --- */
 
 const doc = makeDoc(CHARS);
-const results = { chars: doc.length, at: new Date().toISOString(), metrics: {} };
+const results = {
+  chars: doc.length,
+  at: new Date().toISOString(),
+  /* 窗口尺寸进结果文件：scrollFps 强依赖它，不记下来两个 JSON 就没法对比 */
+  viewport: VIEWPORT ? { width: VIEWPORT[0], height: VIEWPORT[1] } : { width: 800, height: 600, default: true },
+  metrics: {},
+};
 
 console.log(C.b(`MDP Studio 性能基准`));
 console.log(C.d(`文档 ${doc.length.toLocaleString()} 字符 · 按键采样 ${KEYSTROKES} 次 · 节点 ${process.version}`));
@@ -83,6 +102,7 @@ const srv = await startServer({ port: 0, quiet: true, warmup: false, concurrency
 const pool = new ChromePool({ log: () => {} });
 const page = await pool.newPage();
 await page.init();
+if (VIEWPORT) await page.setViewport(VIEWPORT[0], VIEWPORT[1], 1);
 
 /* ---- 1. 应用冷启动：导航 → React 挂载（墙钟，含网络与解析） ---- */
 {

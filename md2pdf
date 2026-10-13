@@ -91,6 +91,27 @@ find_pandoc() {
     [ -n "$PANDOC_VER" ] || PANDOC_VER='?'
 }
 
+# 惰性解析 pandoc。曾经 main 一进来就无条件 find_pandoc，于是**每一次**调用
+# （包括"源文件没变、直接跳过"的那次）都要付一次完整的 pandoc 进程启动：
+# 实测 31ms，占缓存命中端到端 62.6ms 的一半，也是 `md2pdf list` 要 48ms 的原因。
+# 而缓存判定（mtime + 签名哈希）根本不需要 pandoc，签名里也没有 PANDOC_VER。
+#
+# 再拆一层：渲染路径只需要**可执行文件路径**，版本号只有"打印给人看"的地方要
+# （list / doctor）。两者合在一起的话，每渲染一次文档都要多付一次 pandoc 进程
+# 启动去问版本 —— 而那个版本号在这一整条路径上谁也没用。
+ensure_pandoc() {
+    [ -n "$PANDOC" ] && return 0
+    have pandoc || die "未找到 pandoc。安装: brew install pandoc" 2
+    PANDOC=$(command -v pandoc)
+}
+
+ensure_pandoc_version() {
+    ensure_pandoc
+    [ -n "$PANDOC_VER" ] && return 0
+    PANDOC_VER=$("$PANDOC" --version 2>/dev/null | head -1 | awk '{print $2}')
+    [ -n "$PANDOC_VER" ] || PANDOC_VER='?'
+}
+
 engine_family() {
     case $1 in
         xelatex|lualatex|pdflatex|latex|tectonic|latexmk) echo latex ;;
@@ -174,6 +195,7 @@ preset_aliases() {
 json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 cmd_list() {
+    ensure_pandoc_version  # list 要显示 pandoc 版本，这里才真正需要它
     # ---- JSON 输出：供网页工作台 / mdp CLI / 脚本消费，是档位的唯一事实来源 ----
     if [ "${JSON_OUT:-0}" = 1 ]; then
         printf '{"version":"%s","defaultQuality":"%s","engine":"%s","pandoc":"%s","rasterizer":"%s","targets":["pdf","png","html","docx","tex","epub","pptx"],"presets":[' \
@@ -332,7 +354,7 @@ MD2PDF_MONO_FONT="Menlo"
 MD2PDF_JOBS=1                   # 批量并行数
 # MD2PDF_MARGIN=1.2in
 # MD2PDF_FONTSIZE=11pt
-# MD2PDF_WATCH_INTERVAL=1
+# MD2PDF_WATCH_INTERVAL=0.3     # 无 fswatch 时的轮询间隔(秒)
 # 追加给所有任务的 pandoc 参数(每行一个):
 # MD2PDF_EXTRA_ARGS="--citeproc
 # --bibliography=$HOME/refs.bib"
@@ -413,6 +435,30 @@ EOF
 # ------------------------------------------------------------ 参数解析 -------
 add_arg()      { USER_ARGS="${USER_ARGS}${USER_ARGS:+$NL}$1"; }
 
+# 在 parse_args **之前**把 --config 的路径挖出来。
+# 为什么必须提前：配置文件的优先级低于命令行（默认值 < 配置文件 < CLI 参数），
+# 所以它必须在 parse_args **之前**加载；而 parse_args 又不能自己处理它。
+# 这里曾经只有注释"已提前加载"、实际 shift 2 跳过，而"提前加载"那段只认
+# $MD2PDF_CONFIG 环境变量 —— 于是 `md2pdf --config foo.conf` 被完全忽略：
+# 既不生效，路径不存在也不报错（实测 exit=0、静默用默认档位出图）。
+prescan_config() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --config)
+                [ $# -ge 2 ] || usage_err "--config 需要参数"
+                MD2PDF_CONFIG=$2
+                return 0 ;;
+            --config=*)
+                MD2PDF_CONFIG=${1#*=}
+                [ -n "$MD2PDF_CONFIG" ] || usage_err "--config 需要参数"
+                return 0 ;;
+            --)
+                return 0 ;;   # "-- 之后原样交给 pandoc"，不再当配置看
+        esac
+        shift
+    done
+}
+
 usage_err() { err "$1"; printf '  用法: %s [选项] 文件.md ...   (帮助: %s -h)\n' "$PROG" "$PROG" >&2; exit 1; }
 
 parse_args() {
@@ -480,7 +526,8 @@ parse_args() {
         --pdf-engine-opt=*) add_arg "$1"; shift ;;
         --lua-filter|--filter)
                           [ $# -ge 2 ] || usage_err "$1 需要参数"; add_arg "$1"; add_arg "$2"; shift 2 ;;
-        --config)         [ $# -ge 2 ] || usage_err "$1 需要参数"; shift 2 ;;   # 已提前加载
+        --config)         [ $# -ge 2 ] || usage_err "$1 需要参数"; shift 2 ;;   # 已由 prescan_config 提前加载
+        --config=*)       shift ;;                                            # 同上（= 形式）
         --quiet)          QUIET=1; shift ;;
         --verbose)        VERBOSE=1; shift ;;
         --clean)          _cd=${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf
@@ -679,6 +726,7 @@ build_and_run() {
         return 0
     fi
 
+    ensure_pandoc          # 真正要渲染了才解析 pandoc（干跑/缓存命中都不走这里）
     dbg "pandoc $*"
     _errf=$(mktemp "${TMPDIR:-/tmp}/md2pdf-err.XXXXXX")
     "$PANDOC" "$@" 2>"$_errf"
@@ -700,13 +748,28 @@ build_and_run() {
 # ------------------------------------------------------------ 单文件转换 -----
 # 缓存目录：优先 XDG，其次 TMPDIR；都不可写则关闭增量跳过
 pick_cache_dir() {
-    for _d in "${SIG_CACHE_DIR:-}" "${TMPDIR:-/tmp}/md2pdf-cache-$(id -u 2>/dev/null || echo 0)"; do
-        [ -n "$_d" ] || continue
-        if mkdir -p "$_d" 2>/dev/null && [ -w "$_d" ]; then printf '%s\n' "$_d"; return 0; fi
-    done
+    # 第一个候选命中时不该付任何代价：老写法把 "$(id -u)" 写在 for 的列表里，
+    # **每次运行都会被求值**（2.2ms 一次 fork），哪怕第一个目录本来就能用；
+    # 而且总是先 mkdir -p（再 1.6ms），哪怕目录早就存在。
+    # [ -d ] / [ -w ] 是 shell 内建，命中路径因此变成零 fork。
+    if [ -n "${SIG_CACHE_DIR:-}" ]; then
+        if [ -d "$SIG_CACHE_DIR" ] && [ -w "$SIG_CACHE_DIR" ]; then
+            printf '%s\n' "$SIG_CACHE_DIR"; return 0
+        fi
+        if mkdir -p "$SIG_CACHE_DIR" 2>/dev/null && [ -w "$SIG_CACHE_DIR" ]; then
+            printf '%s\n' "$SIG_CACHE_DIR"; return 0
+        fi
+    fi
+    _fallback=${TMPDIR:-/tmp}/md2pdf-cache-$(id -u 2>/dev/null || echo 0)
+    if mkdir -p "$_fallback" 2>/dev/null && [ -w "$_fallback" ]; then
+        printf '%s\n' "$_fallback"; return 0
+    fi
     printf '\n'
 }
-SIG_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf
+# 允许外部指定：bin/mdp.mjs 会显式传 SIG_CACHE_DIR=<项目>/.cache/md2pdf，
+# 想让缓存留在项目里；而这里原来是无条件赋值，把传进来的值直接盖掉 ——
+# 于是"把缓存放进项目"这个意图从来没生效过，用户手写的 SIG_CACHE_DIR 也一样。
+SIG_CACHE_DIR=${SIG_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/md2pdf}
 
 ext_for() {
     if [ "${PNG_MODE:-0}" = 1 ]; then echo png; return 0; fi
@@ -749,12 +812,23 @@ out_for() {
     printf '%s/%s.%s\n' "$_d" "$(base_noext "$_in")" "$_ext"
 }
 
+# 缓存签名：**凡是会改变产物的输入都必须进来**。
+# 漏一项的后果不是"慢"，是"发陈旧产物"：改了这个参数、产物却因为签名没变而被
+# 判定为"未变更"，用户拿到的是上一版。之前漏了 --template / -H / --css /
+# --bibliography / --csl / --lang / --toc-title / --colorlinks / --metadata-file /
+# --resource-path 以及 --page（换页号不重建，直接发第 1 页）。
+# 注意：改动本函数的输出格式会让已有的 .sig 全部失配 → 升级后第一次运行会全量重建一次。
 signature() {
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
-        "$VERSION" "$QUALITY" "$ENGINE" "$TO" "$FONTSIZE" "$MARGIN" "$LINESTRETCH" \
-        "$MAIN_FONT" "$RESOLVED_CJK" "$USE_CJK_VAR" "$MONO_FONT" "$HIGHLIGHT" \
-        "$TOC" "$TOCDEPTH" "$NUMBERS" "$DOCCLASS" "$CLASSON" "$USER_ARGS" \
-        "$PNG_MODE" "$PNG_DPI" "$PNG_TRANSPARENT" | hash_str
+    # 用拼接而不是一长串 %s：参数有 33 个，格式串里少写一个 %s 不会报错，
+    # 只会让 printf 把格式串循环复用、把某个字段悄悄挤掉 —— 那种错没人看得出来。
+    _sig="$VERSION|$QUALITY|$ENGINE|$TO|$FONTSIZE|$MARGIN|$LINESTRETCH"
+    _sig="$_sig|$MAIN_FONT|$RESOLVED_CJK|$USE_CJK_VAR|$MONO_FONT|$HIGHLIGHT"
+    _sig="$_sig|$TOC|$TOCDEPTH|$NUMBERS|$DOCCLASS|$CLASSON|$USER_ARGS"
+    _sig="$_sig|$PNG_MODE|$PNG_DPI|$PNG_TRANSPARENT|$PNG_PAGE"
+    _sig="$_sig|$COLORLINKS|$O_TEMPLATE|$O_TOC_TITLE|$O_LANG"
+    _sig="$_sig|$INCLUDE|$O_INCLUDE|$O_CSS|$O_BIB|$O_CSL"
+    _sig="$_sig|$O_METADATA_FILE|$O_RESOURCE_PATH"
+    printf '%s' "$_sig" | hash_str
 }
 
 # --------------------------------------------------------------- 栅格化 -------
@@ -792,7 +866,11 @@ rasterize_pdf() {   # $1 = 输入 PDF   $2 = 输出 PNG
     fi
     if have gs; then
         _dev=png16m; [ "$PNG_TRANSPARENT" = 1 ] && _dev=pngalpha
-        if gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=$_dev -r "$_dpi" \
+        # -r 的分辨率必须**贴着写**（-r200）。Ghostscript 10 起对 "-r 200"
+        # 直接报错 `-r must be followed by <res>`：写了空格就 exit=1、不产出文件，
+        # 于是这里静默失败、一路掉到最后的 sips 降级 —— 用户明明装了能出真 DPI 的
+        # gs，却拿到 72dpi 放大图，还被提示去装 poppler。贴着写在新旧版本上都合法。
+        if gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=$_dev -r"$_dpi" \
               -dFirstPage="$_page" -dLastPage="$_page" \
               -dTextAlphaBits=4 -dGraphicsAlphaBits=4 \
               -sOutputFile="$_rpng" "$_rpdf" 2>/dev/null && [ -s "$_rpng" ]; then
@@ -829,7 +907,12 @@ rasterize_pdf() {   # $1 = 输入 PDF   $2 = 输出 PNG
 convert_one() {
     _in=$1
     _out=$(out_for "$_in")
+    # 输出名没有目录部分时（`-o out.pdf`），${_out%/*} 会原样返回文件名本身 ——
+    # 于是 mkdir 建出一个**同名目录**，紧接着 mv 把产物搬进那个目录里，
+    # 还对着一份不存在于指定路径的产物打印"✓"。out_for 里早就处理了这个边界
+    # （`[ "$_d" = "$_in" ] && _d=.`），这里漏了。
     _dir=${_out%/*}
+    [ "$_dir" = "$_out" ] && _dir=.
     [ -d "$_dir" ] || mkdir -p "$_dir" || { err "无法创建目录 $_dir"; return 1; }
 
     resolve_fonts "$_in"
@@ -837,7 +920,10 @@ convert_one() {
     if [ -n "$SIG_CACHE_DIR" ] && [ "$FORCE" != 1 ] && [ "$DRY" != 1 ] \
        && [ -f "$_out" ] && [ "$_out" -nt "$_in" ]; then
         _sigf=$SIG_CACHE_DIR/$(printf '%s' "$_out" | hash_str).sig
-        if [ -f "$_sigf" ] && [ "$(cat "$_sigf")" = "$(signature)" ]; then
+        # 用 read 内建代替 $(cat)：省一个进程。签名是单行的，语义等价。
+        _stored=''
+        [ -f "$_sigf" ] && IFS= read -r _stored < "$_sigf"
+        if [ "$_stored" = "$(signature)" ]; then
             note "${C_D}跳过(未变更)${C_0} $_out"
             return 0
         fi
@@ -902,29 +988,110 @@ convert_one() {
 # -------------------------------------------------------------- watch 模式 ---
 mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
 
+# 源文件指纹：mtime + 内容哈希。只看 mtime 会漏掉"同一秒内改两次"
+# （bash 3.2 的 -nt 只有秒级粒度），加哈希才稳。
+source_fingerprint() {
+    _fp=''
+    _oldifs=$IFS; IFS=$NL
+    for _f in $INPUTS; do _fp="$_fp$(mtime_of "$_f"):$(hash_file "$_f");"; done
+    IFS=$_oldifs
+    printf '%s' "$_fp"
+}
+
+# watch 循环的簿记（都在 set -u 下先声明）
+_WATCH_CPID=''    # 正在跑的编译的进程组 ID（kill-and-restart 用）
+_WATCH_FPID=''    # fswatch 的 PID（退出时要收掉，否则它一直占着事件订阅）
+_WATCH_DIR=''     # FIFO 所在的临时目录
+_WATCH_FD8=''     # fd 8 是否已被占用（exec 8>&- 不能对着没开的 fd 发）
+
+# 收掉上一次编译 —— **连它的整个进程组**。
+# 为什么必须动进程组：pandoc 自己会拉起 xelatex，只杀外面那层 shell 的话子进程会
+# 变成孤儿继续跑（实测：杀掉 wrapper 后 leaf 仍然活着）。高频保存时这正是"同时拉起
+# 几十个 xelatex 把内存打爆"的来源。set -m 让每个后台任务独占一个进程组
+# （sh 下实测 pgid == pid），于是可以整组发信号。
+watch_kill_running() {
+    [ -n "${_WATCH_CPID:-}" ] || return 0
+    kill -TERM -"$_WATCH_CPID" 2>/dev/null || kill -TERM "$_WATCH_CPID" 2>/dev/null
+    sleep 0.2                                   # 给 LaTeX 一点时间自己收拾临时文件
+    kill -KILL -"$_WATCH_CPID" 2>/dev/null
+    wait "$_WATCH_CPID" 2>/dev/null             # 回收，别留僵尸
+    _WATCH_CPID=''
+}
+
+watch_compile() {
+    watch_kill_running
+    info "${C_D}$(date '+%H:%M:%S') ${1:-检测到改动，重新编译…}${C_0}"
+    convert_one "$INPUTS" &
+    _WATCH_CPID=$!
+}
+
+# 收摊：编译、事件源、FIFO、临时目录都要清干净。
+# 漏掉 fswatch 的后果实测过：Ctrl-C 之后它还在后台跑，一直占着 inotify/FSEvents
+# 的订阅不放（下次再开 watch 就会有两个 watcher 抢事件）。
+watch_teardown() {
+    watch_kill_running
+    if [ -n "${_WATCH_FPID:-}" ]; then
+        kill "$_WATCH_FPID" 2>/dev/null
+        wait "$_WATCH_FPID" 2>/dev/null
+        _WATCH_FPID=''
+    fi
+    # 只在真的开过 fd 8 时才关：exec 是特殊内建，重定向失败在非交互 shell 里
+    # 会直接把整个脚本带走，不能裸写 exec 8>&-。
+    if [ -n "${_WATCH_FD8:-}" ]; then exec 8>&-; _WATCH_FD8=''; fi
+    [ -n "${_WATCH_DIR:-}" ] && rm -rf "$_WATCH_DIR"
+    _WATCH_DIR=''
+}
+
+# 首选：内核文件事件（fswatch）。OS 层直接推事件，毫秒级，且不轮询。
+# 用 FIFO 而不是管道把事件接进**当前 shell**：若是 `fswatch | while read`，
+# 循环体跑在子 shell 里，compil 的后台 PID 与 trap 都落在外层，无法干净收尾。
+watch_events_fswatch() {
+    _WATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/md2pdf-watch.XXXXXX") || return 1
+    _wfifo=$_WATCH_DIR/events
+    mkfifo "$_wfifo" 2>/dev/null || { rm -rf "$_WATCH_DIR"; _WATCH_DIR=''; return 1; }
+    exec 8<> "$_wfifo"                     # 常驻读写端：写端退出也不会 EOF，循环不会空转
+    _WATCH_FD8=1
+    # -o：按事件批次输出一行；-l：合并突发（编辑器一次保存往往触发多个事件）
+    fswatch -o -l "$WATCH_LATENCY" -- "$INPUTS" > "$_wfifo" 2>/dev/null &
+    _WATCH_FPID=$!
+    while IFS= read -r _ev <&8; do watch_compile; done
+    watch_teardown
+    return 0
+}
+
+# 兜底：没有 fswatch 时轮询。间隔可调（默认 0.3s，比原来的 1s 快 3 倍）。
+watch_events_poll() {
+    _sig=$(source_fingerprint)
+    while :; do
+        sleep "$WATCH_INTERVAL"
+        _new=$(source_fingerprint)
+        [ "$_new" = "$_sig" ] && continue
+        _sig=$_new
+        watch_compile
+    done
+}
+
 watch_loop() {
     _cnt=$(printf '%s\n' "$INPUTS" | grep -c .)
     [ "$_cnt" = 1 ] || die "-w 监听模式一次只支持一个文件" 1
 
-    _sig=''
-    _oldifs=$IFS; IFS=$NL
-    for _f in $INPUTS; do _sig="$_sig$(mtime_of "$_f"):$(hash_file "$_f");"; done
-    IFS=$_oldifs
+    # 让后台编译独占进程组（见 watch_kill_running）。副作用是 shell 会打印
+    # 一行 "Terminated" 作业通知 —— 在这里恰好是有用的信息，不屏蔽。
+    set -m
+    trap 'watch_teardown; cleanup; printf "\n" >&2; info "已停止监听"; exit 0' INT TERM HUP
 
-    info "${C_B}监听中${C_0} $INPUTS  ${C_D}(Ctrl-C 退出 · 间隔 ${WATCH_INTERVAL}s)${C_0}"
-    convert_one "$INPUTS" || true
-    trap 'cleanup; printf "\n" >&2; info "已停止监听"; exit 0' INT TERM HUP
-    while :; do
-        sleep "$WATCH_INTERVAL"
-        _new=''
-        _oldifs=$IFS; IFS=$NL
-        for _f in $INPUTS; do _new="$_new$(mtime_of "$_f"):$(hash_file "$_f");"; done
-        IFS=$_oldifs
-        [ "$_new" = "$_sig" ] && continue
-        _sig=$_new
-        info "${C_D}$(date '+%H:%M:%S') 检测到改动，重新编译…${C_0}"
-        convert_one "$INPUTS" || true
-    done
+    info "${C_B}监听中${C_0} $INPUTS  ${C_D}(Ctrl-C 退出)${C_0}"
+    # 初次编译也走后台：以前这里是同步 convert_one，一次编译 3~4 秒里事件源
+    # 根本还没接上，这段时间的改动会被整个吞掉。
+    watch_compile "初次编译…"
+
+    if have fswatch; then
+        info "${C_D}内核文件事件（fswatch · 突发合并 ${WATCH_LATENCY}s）${C_0}"
+        watch_events_fswatch || watch_events_poll
+    else
+        info "${C_D}无 fswatch，退回轮询（间隔 ${WATCH_INTERVAL}s）· brew install fswatch 可做到毫秒级${C_0}"
+        watch_events_poll
+    fi
 }
 
 # ------------------------------------------------------------------ 主流程 ---
@@ -951,7 +1118,8 @@ main() {
         err "doctor --json 需要 node ≥ 20 与 bin/mdp.mjs"; exit 4
     fi
     [ "${DOCTOR:-0}" = 1 ] && cmd_doctor
-    find_pandoc
+    # pandoc 的解析推迟到真正要用它的地方（cmd_list / build_and_run），
+    # 见 ensure_pandoc 的注释：这里是每次调用最贵的一笔固定开销。
     [ "${LIST_ARGS:-0}" = 1 ] && cmd_list
 
     # 无参数：当前目录只有一个 .md 时直接用它
@@ -996,11 +1164,17 @@ main() {
 
     case $JOBS in ''|*[!0-9]*) JOBS=1 ;; esac
     [ "$JOBS" -lt 1 ] && JOBS=1
-    WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-1}
+    WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-0.3}
+    WATCH_LATENCY=${MD2PDF_WATCH_LATENCY:-0.2}
 
     [ "$WATCH" = 1 ] && { watch_loop; exit $?; }
 
-    _n=$(printf '%s\n' "$INPUTS" | grep -c .)
+    # 输入计数：用 shell 自己数，不 fork printf/grep（这条在缓存命中路径上，2.5ms）。
+    # INPUTS 以 NL 分隔且不含空项，所以按 IFS 数一遍与 grep -c . 等价。
+    _n=0
+    _oldifs=$IFS; IFS=$NL
+    for _f in $INPUTS; do _n=$((_n + 1)); done
+    IFS=$_oldifs
 
     if [ "$DRY" = 1 ]; then
         _oldifs=$IFS; IFS=$NL
@@ -1021,16 +1195,45 @@ main() {
     fi
 
     _sd=$(mktemp -d "${TMPDIR:-/tmp}/md2pdf-jobs.XXXXXX")
-    _i=0; _run=0
-    _oldifs=$IFS; IFS=$NL
-    for _f in $INPUTS; do
-        _i=$((_i + 1))
-        ( convert_one "$_f"; printf '%s' "$?" > "$_sd/$_i" ) &
-        _run=$((_run + 1))
-        [ "$_run" -ge "$JOBS" ] && { wait; _run=0; }
-    done
-    IFS=$_oldifs
-    wait
+    # 滑动窗口而不是"批次屏障"。
+    # 老写法是 `[ "$_run" -ge "$JOBS" ] && { wait; _run=0; }` —— 无参 wait 等的是
+    # **全部**子进程，于是每凑满 JOBS 个就整体停一次：一批里只要有一个慢文件，
+    # 同批其余已经跑完的槽位也一起空等。文件耗时越不均匀，浪费越大。
+    # 现在改成 FIFO 完成信道：每完成一个就放行下一个，槽位不空转。
+    # 用 FIFO 而不是管道，是为了让 convert_one 仍然跑在自己的子 shell 里
+    # （管道会让循环体整体落进一个子 shell，PID 与退出码就不好收了）。
+    _fifo=$_sd/done
+    if mkfifo "$_fifo" 2>/dev/null; then
+        exec 9<> "$_fifo"                      # 常驻读写端：写端退出也不会 EOF
+        _i=0; _run=0
+        _oldifs=$IFS; IFS=$NL
+        for _f in $INPUTS; do
+            _i=$((_i + 1))
+            ( convert_one "$_f"; printf '%s' "$?" > "$_sd/$_i"; printf '\n' >&9 ) &
+            _run=$((_run + 1))
+            if [ "$_run" -ge "$JOBS" ]; then
+                # 阻塞到"任意一个"完成即可，不等整批
+                IFS= read -r _tok <&9
+                _run=$((_run - 1))
+            fi
+        done
+        IFS=$_oldifs
+        wait
+        exec 9>&-
+    else
+        # mkfifo 不可用（极少数文件系统）→ 退回原来的批次屏障，行为正确但慢一些
+        warn "无法创建 FIFO，并发退回批次模式"
+        _i=0; _run=0
+        _oldifs=$IFS; IFS=$NL
+        for _f in $INPUTS; do
+            _i=$((_i + 1))
+            ( convert_one "$_f"; printf '%s' "$?" > "$_sd/$_i" ) &
+            _run=$((_run + 1))
+            [ "$_run" -ge "$JOBS" ] && { wait; _run=0; }
+        done
+        IFS=$_oldifs
+        wait
+    fi
     _fails=0
     for _s in "$_sd"/*; do [ -f "$_s" ] && [ "$(cat "$_s")" != 0 ] && _fails=$((_fails + 1)); done
     rm -rf "$_sd"
@@ -1050,7 +1253,8 @@ TO=${MD2PDF_TO:-pdf}
 PNG_MODE=0; PNG_DPI=${MD2PDF_PNG_DPI:-200}; PNG_PAGE=${MD2PDF_PNG_PAGE:-1}
 PNG_TRANSPARENT=0; PNG_KEEP_PDF=0; JSON_OUT=0; RASTER_TOOL=''
 JOBS=${MD2PDF_JOBS:-1}
-WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-1}
+WATCH_INTERVAL=${MD2PDF_WATCH_INTERVAL:-0.3}
+WATCH_LATENCY=${MD2PDF_WATCH_LATENCY:-0.2}
 CJK_MODE=${MD2PDF_CJK:-auto}
 OUTPUT=''; OUTDIR=''; USER_ARGS=''; FILES=''; INPUTS=''
 STDIN_TMP=''; CONF_FILES=''
@@ -1065,6 +1269,7 @@ COLORLINKS=0; DOCCLASS=''; CLASSON=''; HIGHLIGHT=''; GEOM_EXTRA=''; INCLUDE=''
 MAIN_FONT=''; MONO_FONT=''; CJK_FONT=auto; RESOLVED_CJK=''; USE_CJK_VAR=0; CJK_ON=0
 
 # --------------------------------------------------------------- 用户配置 ----
+prescan_config "$@"
 for _c in "$MD2PDF_HOME/md2pdf.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/md2pdf/config.sh"; do
     if [ -n "${MD2PDF_CONFIG:-}" ] && [ "$_c" = "$MD2PDF_HOME/md2pdf.conf" ]; then continue; fi
     if [ -f "$_c" ]; then

@@ -135,6 +135,14 @@ button { cursor: pointer; }
   background: var(--bg);
 }
 .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+/* 编辑 + 预览的工作区：编辑区按 splitRatio 占位，预览拿剩下的。
+   两者都允许收缩到 0（min-width:0），否则 CodeMirror 的最小内容宽度会把预览挤没。 */
+.work-area { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.work-editor { display: flex; flex-grow: 0; flex-shrink: 1; min-width: 0; min-height: 0; }
+.work-preview {
+  display: flex; flex: 1; min-width: 0; min-height: 0;
+  border-left: 1px solid var(--border);
+}
 .pane-head {
   display: flex; align-items: center; gap: 8px;
   height: 30px; padding: 0 6px 0 12px; flex: 0 0 auto;
@@ -345,17 +353,18 @@ input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px;
 
 /* -------------------------------------------------------------- 预览 --- */
 .preview-scroll { height: 100%; overflow: auto; padding: 22px 18px 80px; background: var(--bg); }
-.preview-paper {
-  max-width: 100%;
+/* 缩放外壳：撑起「缩放后」的高度，让滚动条与实际可见高度一致。
+   transform 不参与布局，所以高度由 PreviewPane 实测 paper 高度后显式写入。 */
+.preview-scale-wrap {
   margin: 0 auto;
+  position: relative;
+}
+.preview-paper {
+  transform-origin: top left;
   border-radius: 6px;
   box-shadow: var(--paper-shadow);
   overflow: hidden;
-  transition: max-width var(--t);
 }
-.preview-z-90 .preview-paper { max-width: 90%; }
-.preview-z-75 .preview-paper { max-width: 75%; }
-.preview-z-100 .preview-paper { max-width: 100%; }
 .preview-empty {
   display: grid; place-items: center; height: 100%; color: var(--fg-mute);
   font-size: 13px; text-align: center; line-height: 1.8;
@@ -412,6 +421,41 @@ input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px;
 .route-title { font-weight: 600; font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
 .route-blurb { font-size: 11px; color: var(--fg-mute); margin-top: 2px; line-height: 1.45; }
 
+/* ---- 导出路线：分组 + 紧凑网格 ----
+   7 条路线平铺一列时，344px 宽的抽屉里要滚很久，"还能导出别的格式"反而被埋住。
+   分组标题让类别一眼可见，卡片压成两列小方块，说明挪进 title。 */
+.route-group { margin-bottom: 9px; }
+.route-group-head {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+  color: var(--fg-mute); text-transform: uppercase; margin-bottom: 5px;
+}
+.route-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.route-chip {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg-2); color: var(--fg); font-size: 12px; text-align: left;
+  transition: all var(--t); min-width: 0;
+}
+.route-chip:hover { border-color: var(--border-strong); background: var(--bg-3); }
+.route-chip.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-fg); font-weight: 600; }
+.route-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quick-export { justify-content: flex-start; }
+.quick-export:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 分段控件（产物范围切换） */
+.seg {
+  display: inline-flex; border: 1px solid var(--border); border-radius: 7px;
+  overflow: hidden; background: var(--bg-2);
+}
+.seg-btn {
+  padding: 3px 8px; font-size: 10.5px; color: var(--fg-mute); background: transparent;
+  border: 0; cursor: pointer; white-space: nowrap;
+}
+.seg-btn + .seg-btn { border-left: 1px solid var(--border); }
+.seg-btn:hover { background: var(--bg-3); color: var(--fg); }
+.seg-btn.active { background: var(--accent-soft); color: var(--accent-fg); font-weight: 600; }
+
 .cmd-box {
   font-family: var(--font-mono); font-size: 11px; line-height: 1.55;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
@@ -429,11 +473,50 @@ input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px;
 .artifact-thumb {
   width: 52px; height: 52px; flex: 0 0 auto; border-radius: 7px; overflow: hidden;
   background: var(--bg-3); display: grid; place-items: center; border: 1px solid var(--border);
+  position: relative; padding: 0; cursor: zoom-in;
 }
 .artifact-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+.artifact-zoom {
+  position: absolute; right: 2px; bottom: 2px; opacity: 0;
+  background: rgba(0, 0, 0, .55); color: #fff; border-radius: 4px; padding: 1px 3px;
+  transition: opacity var(--t);
+}
+.artifact-thumb:hover .artifact-zoom { opacity: 1; }
 .artifact-meta { flex: 1; min-width: 0; }
 .artifact-name { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .artifact-sub { font-size: 10.5px; color: var(--fg-mute); font-family: var(--font-mono); margin-top: 2px; }
+
+/* ---- 产物灯箱：页内放大预览 ---- */
+.lightbox {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(8, 10, 16, .68); backdrop-filter: blur(3px);
+  display: grid; place-items: center; padding: 3vh 3vw;
+}
+.lightbox-panel {
+  display: flex; flex-direction: column; max-width: 94vw; max-height: 94vh;
+  background: var(--bg-1); border: 1px solid var(--border-strong);
+  border-radius: 12px; overflow: hidden; box-shadow: 0 24px 70px -20px rgba(0, 0, 0, .6);
+}
+.lightbox-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 12px; border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.lightbox-title {
+  font-size: 12.5px; font-weight: 600; max-width: 42ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lightbox-body {
+  flex: 1; min-height: 0; overflow: auto; padding: 14px;
+  display: grid; place-items: center; background: var(--bg);
+}
+.lightbox-body img { max-width: 100%; height: auto; border-radius: 6px; box-shadow: var(--paper-shadow); }
+.lightbox-body iframe { width: 78vw; height: 78vh; border: 0; border-radius: 6px; background: #fff; }
+.lightbox-text { text-align: center; color: var(--fg-mute); font-size: 12px; line-height: 1.9; }
+.lightbox-text .mono { word-break: break-all; }
+.lightbox-foot {
+  padding: 7px 12px; border-top: 1px solid var(--border); background: var(--bg-2);
+  font-size: 10.5px; color: var(--fg-mute); word-break: break-all;
+}
 
 /* -------------------------------------------------------------- 状态栏 -- */
 .statusbar {

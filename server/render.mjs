@@ -496,6 +496,7 @@ export async function executeRender(req, ctx) {
         dpi: req.png.dpi,
         page: req.png.page || 1,
         transparent: req.png.transparent,
+        signal,
         onLog: (s, l) => relayEngineLog(log, s, l),
       });
       if (!raster.ok) {
@@ -513,9 +514,9 @@ export async function executeRender(req, ctx) {
     } else {
       const tp = Date.now();
       ctx.progress?.(pctNow(), 'Chromium 正在渲染并截图', etaNow());
-      const shot = await renderHtmlToPng({
+      const shot = await abortable(signal, chromePool, log, () => renderHtmlToPng({
         pool: chromePool, baseUrl, built, req, outPath, log,
-      });
+      }));
       stage('PNG 已生成', budgets.get('png') || 800);
       recordTiming('png', chars, Date.now() - tp);
       for (const w of shot.warnings) { warnings.push(w); log('warn', w); }
@@ -532,7 +533,7 @@ export async function executeRender(req, ctx) {
     const outPath = path.join(workDir, `${req.filename}.html.pdf`);
     const tph = Date.now();
     ctx.progress?.(pctNow(), 'Chromium 正在打印 PDF', etaNow());
-    const buf = await renderHtmlToPdf({ pool: chromePool, baseUrl, built, req, log });
+    const buf = await abortable(signal, chromePool, log, () => renderHtmlToPdf({ pool: chromePool, baseUrl, built, req, log }));
     await fsp.writeFile(outPath, buf);
     stage('PDF 已打印', budgets.get('pdf-html') || 600);
     recordTiming('pdf-html', chars, Date.now() - tph);
@@ -589,6 +590,36 @@ export async function executeRender(req, ctx) {
 
 function abortError() {
   return Object.assign(new Error('任务已取消'), { aborted: true });
+}
+
+/**
+ * 让"发出去就收不回来"的 Chromium 调用变可中断。
+ *
+ * CDP 的 Page.captureScreenshot / printToPDF 一旦发出**没有取消消息**：
+ * 唯一能在半路停下的办法是把浏览器进程干掉 —— 连接一断，所有 pending 的 CDP
+ * 请求立刻 reject（见 chrome.mjs 的 ws 'close' 处理）。
+ *
+ * 代价：这次浏览器实例作废，下一次渲染会自己重新拉起（chromePool.ensure() 会
+ * 发现 cdp 已关闭并重启）。收益：用户点「取消」时立刻停住一个正跑在 10 万字
+ * 文档上的截图，而不是干等十几秒 —— 取消的意义全在这里。
+ */
+async function abortable(signal, pool, log, fn) {
+  if (!signal) return fn();
+  if (signal.aborted) throw abortError();
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => {
+      log?.('warn', '取消已生效：终止 Chromium 会话（下次渲染会自动重启）');
+      Promise.resolve(pool?.close?.()).catch(() => {});
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([fn(), aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
 }
 
 /** md2pdf 的输出重定向到任务日志，并做轻量着色提示。 */

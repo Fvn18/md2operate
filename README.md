@@ -130,7 +130,7 @@ mdp build 论文.md -t pdf -n             # 只打印将要执行的命令
 | `--via` | `html` \| `latex`：选产出引擎（`png` 默认 html，`pdf` 默认 latex） |
 | `-q, --quality` | 质量档位（LaTeX 路线）：`draft` `std` `high` `press` `cn` `screen` `slides` |
 | `-e, --engine` | `xelatex` `lualatex` `pdflatex` `tectonic` `typst` |
-| `-o, --output` `-d, --outdir` | 输出文件 / 目录 |
+| `-o, --output` `-d, --outdir` | 输出文件 / 目录（`--out` `--out-dir` 同义） |
 | `--dpi N` | PNG 分辨率（36–1200，默认 200）；`300` 打印，`600` 印刷 |
 | `--card` / `--no-card` | 分享卡片（宽度确定，贴紧内容）/ 整页长图 |
 | `--transparent` | PNG 透明背景 |
@@ -145,8 +145,25 @@ mdp build 论文.md -t pdf -n             # 只打印将要执行的命令
 | `--` | 之后的参数原样交给 pandoc |
 | `--json` `-n/--dry-run` `-f/--force` `-Q/--quiet` `-v/--verbose` | 脚本化与排错 |
 
-其它子命令：`mdp doctor [--json]`、`mdp presets [--json]`、`mdp routes`、
-`mdp themes`、`mdp clean`、`mdp help`。
+### 子命令一览
+
+帮助是**按命令**给的：`mdp help build` 只讲 build 最该记住的十几个参数，
+`mdp help build --all` 才是完整清单。打错字会给建议（`mdp biuld` →
+"你是想输入 build 吗？"，`--dpp` → "你是想输入 --dpi 吗？"）。
+
+| 命令 | 别名 | 说明 |
+|:--|:--|:--|
+| `mdp serve` | `web` `studio` `gui` | 启动网页工作台 |
+| `mdp build` | `render` `make` `export` | 直接产出文件 |
+| `mdp doctor` | `check` `env` | 环境体检 |
+| `mdp list [presets\|routes\|themes]` | `presets` `ls` | 查看档位 / 路线 / 主题（不带参数则三者都列） |
+| `mdp routes` / `mdp themes` | — | 只查其中一类 |
+| `mdp clean` | `cleanup` | 清空 `.artifacts` |
+| `mdp help [命令]` | — | 总览 / 单命令详解 |
+
+统一命名的原则是**旧写法永远保留为别名**：`mdp presets`、`--preset`、
+`--fontsize-px`、`--keep-pdf` 这些老脚本里在用的写法一个都没失效，只是现在
+有了更一致的首选写法。
 
 ### 对原 `md2pdf` 的扩展（完全向后兼容）
 
@@ -309,8 +326,13 @@ $E=mc^2$  与  $$\int_0^1 x^2\,dx=\frac13$$      # 数学（$…$、$$…$$、\(
 ## 8. 自检与故障排查
 
 ```sh
-npm run verify:all      # 7 个套件、112 项断言，全部真实执行（0 失败）
+npm run verify:all      # 全部套件，真实执行（含浏览器与外部命令）
 npm run verify          # 渲染与导出：渲染器 / 增量渲染 / 真 DPI / PDF 结构 / 自包含 HTML
+npm run verify:fast     # 四个纯 Node 套件（无需 Chromium，秒级）
+npm run verify:preview  # 预览差量引擎：块复用 / 重复块 key / 与导出逐字节一致
+npm run verify:scrollmap # 行 ↔ 像素双向映射、虚拟化视口计算、锚定 vs 比例
+npm run verify:persist  # 本地持久化：IndexedDB、8MB 文档、迁移幂等、竞态不丢字
+npm run verify:cancel   # 请求熔断与取消传播（断开连接 = 杀掉子进程）
 npm run verify:ai       # AI 代理与配置安全（mock 模式，无需密钥）
 npm run verify:export   # 进度事件 / 耗时预估学习 / 1200 DPI
 npm run verify:sync     # 锚定式滚动同步（像素级判据）
@@ -322,6 +344,10 @@ mdp doctor              # 环境能力与安装提示（--json 机器可读）
 md2pdf doctor --selftest  # 原有的实编译自检（draft / std / cn 三档）
 ```
 
+`verify:preview` / `verify:scrollmap` / `verify:persist` / `verify:cancel` 四个套件
+**不需要 Chromium**（`fake-indexeddb` + 纯函数），所以放在 `verify:fast` 里，改完
+代码可以秒级回归；需要浏览器的套件留在后面。
+
 | 现象 | 原因与处理 |
 |:--|:--|
 | 页面空白 / 按钮无反应 | 多半是 `web/dist` 未构建：`npm run build`。未构建时后台会给出说明页 |
@@ -330,7 +356,9 @@ md2pdf doctor --selftest  # 原有的实编译自检（draft / std / cn 三档�
 | 公式显示为纯文本 | 检查是否误用了单个 `$` 包裹多行；多行请用 `$$` 独占一行 |
 | 中文不出字 / 缺字 | 中文 PDF 用 `-q cn`（ctex）；HTML 路线确认系统装了 PingFang/Noto CJK |
 | 端口被占用 | `mdp serve` 会自动向后找端口；也可 `--port` 指定 |
-| 产物找不到了 | 产物在 `.artifacts/<jobId>/`；网页「产物」面板列出磁盘历史，可复制路径 |
+| 产物找不到了 | 产物在 `.artifacts/<jobId>/`；网页「产物」面板可切「本次 / 全部」、点缩略图放大预览、复制完整路径 |
+| 预览太窄看不清 | 拖宽编辑/预览之间的分割条（宽度让给预览），或点顶部的缩放按钮临时切到 100% |
+| 导出只有 PNG？ | 面板「导出路线」7 条全部可选且**可多选**；顶部还有「分享长图 / 论文 PDF / 秒级 PDF / 全都要」一键组合 |
 | 想清空重来 | `mdp clean`（产物）、`md2pdf --clean`（增量缓存）、浏览器清除站点数据（文档） |
 
 ---
@@ -660,6 +688,19 @@ DOM 无限堆积（10 万节点 → 17 万）→ 页面冻死、滚动跌到 1.4
   逐键延迟从 424ms 降到 62ms，代价是视口外块的高度是估算值——这会让"跳到远处"的
   滚动位置延迟收敛，也是锚定式同步必须做时间窗口收敛的原因（见第 14 节）。
   导出页用 `data-static="1"` 关闭它，保证分页与截图不缺内容。
+* **预览按导出宽度排版，靠等比缩放适配面板，而不是收窄宽度重排。**
+  早期实现把 `paperWidth` 当成 `max-width` 用，于是面板一窄，预览就用更窄的宽度
+  重新排版：公式换了行、标题折了行，看到的根本不是导出产物。现在纸张恒定
+  `paperWidth`（卡片 = 正文宽 + 内边距，整页 = 纸宽），容器放不下时整体
+  `transform: scale()` 缩小，`transform` 不参与布局，所以外面再套一层撑起缩放后的
+  高度让滚动条准确。顶部按钮在 `自适应 → 100% → 75% → 50%` 间循环。
+  这让出了一个新的自由度：编辑/预览之间的分割条**可以拖**（`splitRatio`，0.2–0.8），
+  嫌预览小就把宽度让给它，而不是只能关掉侧栏与导出面板。
+* **预览虚拟化默认开。** 块数 ≥60 时只挂视口附近的块（10 万字符文档稳定在几十个
+  节点，SLO ≤1500），代价是浏览器自带的页内查找命中不了未挂载的块，需要全文查找
+  时用预览头部的「虚拟」开关临时关掉。**测试语料里的老断言"所有块都在 DOM 里"
+  已经作废**：`verify-worker.mjs`（依赖该断言、且与 `verify-preview.mjs` 覆盖重叠）
+  已删除。
 * **方案 B 不重写渲染引擎。** Python 侧只是 FastAPI 宿主 + 网关；引擎仍只有一份
   Node 实现。若你需要"零 Node 依赖"，那是一个独立的大工程（约等于重写
   `render.mjs` / `chrome.mjs` / `raster.mjs`），而不是把 `mdp_server.py` 写长一点。

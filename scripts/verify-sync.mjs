@@ -19,6 +19,11 @@ const doc = makeDoc(60000);
 const srv = await startServer({ port: 0, quiet: true, warmup: false, log: () => {} });
 const pool = new ChromePool({ log: () => {} });
 const page = await pool.newPage(); await page.init();
+/* 必须先给一个像样的视口：Chromium 默认 800×600，而侧栏 + 导出面板 + 控制台一开，
+   预览只剩 ~56px 宽。预览现在按导出宽度排版并等比缩放，56px 下 scale 约 0.02，
+   屏幕上等于什么都看不见 —— 本用例度量的是"滚动对齐"，前提是预览真的可见。
+   （原来不设视口也能过，是因为旧实现会把正文压到 56px 宽重排一遍，块照样有高度。） */
+await page.setViewport(1560, 940, 1);
 await page.goto(srv.url + '/', 30000);
 await page.evaluate(`(() => { const n=Date.now();
   localStorage.setItem('mdp.studio.v2.docs', JSON.stringify([{id:'s',name:'sync',content:${JSON.stringify(doc)},createdAt:n,updatedAt:n}]));

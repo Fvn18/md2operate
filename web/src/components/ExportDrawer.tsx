@@ -10,14 +10,18 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useStudio } from '../lib/store';
 import { api, buildPayload } from '../lib/api';
 import { Icon, type IconName } from './Icons';
-import type { Artifact, Job, MetaResponse, Target } from '../lib/types';
+import type { Artifact, Job, MetaResponse, RenderSettings, Target } from '../lib/types';
 
 interface Props {
   meta: MetaResponse | null;
   job: Job | null;
   busy: boolean;
   running: boolean;
-  onRender: () => void;
+  onRender: (override?: {
+    targets?: Target[];
+    png?: Partial<RenderSettings['png']>;
+    doc?: Partial<RenderSettings['doc']>;
+  }) => void;
   onCancel: () => void;
   onRetry: () => void;
   onToast: (kind: 'ok' | 'err' | 'warn' | 'info', title: string, msg?: string) => void;
@@ -26,6 +30,42 @@ interface Props {
 const ROUTE_ICON: Record<string, IconName> = {
   png: 'image', pdf: 'file', 'pdf-html': 'globe', tex: 'code', html: 'globe', docx: 'word', md: 'file',
 };
+
+/**
+ * 导出路线的分组。
+ *
+ * 原来 7 张卡片平铺成一列，每张都带 2~3 行说明，在 344px 宽的抽屉里要滚很久才能
+ * 看全，"还能导出别的格式"这件事反而被埋住了。分组后一眼能看出有哪几类，卡片改成
+ * 紧凑网格，说明挪到 title 里（悬停可看），需要细节时再看。
+ */
+const ROUTE_GROUPS: Array<{ title: string; icon: IconName; ids: string[] }> = [
+  { title: '图片', icon: 'image', ids: ['png'] },
+  { title: '文档', icon: 'file', ids: ['pdf', 'pdf-html', 'docx'] },
+  { title: '源码 / 网页', icon: 'code', ids: ['tex', 'html', 'md'] },
+];
+
+/** 一键常用组合：先选路线再渲染，不用去点卡片。 */
+const QUICK_EXPORTS: Array<{
+  id: string; label: string; hint: string; icon: IconName;
+  targets: Target[]; png?: Partial<RenderSettings['png']>;
+}> = [
+  {
+    id: 'share', label: '分享长图', hint: 'PNG 卡片 · 300 DPI · 适合发群/社交', icon: 'image',
+    targets: ['png'], png: { mode: 'card', dpi: 300 },
+  },
+  {
+    id: 'paper', label: '论文 PDF', hint: 'pandoc + XeLaTeX · 带目录与编号', icon: 'file',
+    targets: ['pdf'],
+  },
+  {
+    id: 'webfast', label: '秒级 PDF', hint: 'Chromium 打印 · 样式与预览一致', icon: 'globe',
+    targets: ['pdf-html'],
+  },
+  {
+    id: 'all', label: '全都要', hint: 'PNG + PDF(LaTeX) + HTML 一次产出', icon: 'package',
+    targets: ['png', 'pdf', 'html'],
+  },
+];
 
 export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onRetry, onToast }: Props) {
   const { state, activeDoc, patchSettings, patchUi, pushToast, addDoc } = useStudio();
@@ -45,6 +85,19 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
     const seen = new Set(jobArtifacts.map((a) => a.rel));
     return [...jobArtifacts, ...recent.filter((a) => !seen.has(a.rel))];
   }, [jobArtifacts, recent]);
+
+  /* 产物页：默认只看本次任务，可切到"全部"（含历史产物）。
+     默认放"本次"是因为最常见的诉求是"我刚导出的那张图在哪"。 */
+  const [artScope, setArtScope] = useState<'job' | 'all'>('job');
+  const visibleArtifacts = artScope === 'job' ? jobArtifacts : shown;
+  /* 点击产物缩略图 → 页内大图预览（PNG 直接看，PDF 用 iframe，其余给下载入口） */
+  const [previewArt, setPreviewArt] = useState<Artifact | null>(null);
+  useEffect(() => {
+    if (!previewArt) return undefined;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPreviewArt(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewArt]);
 
   /* 「命令」页实时反映当前设置 → 真实命令行（400ms 防抖） */
   useEffect(() => {
@@ -116,26 +169,59 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
               />
             </label>
 
-            <div className="side-section-title" style={{ marginTop: 4 }}><Icon name="layers" size={11} /> 导出路线（可多选）</div>
-            <div className="col" style={{ gap: 6 }}>
-              {routes.map((r) => (
-                <label key={r.id} className={`route-card ${settings.targets.includes(r.id) ? 'active' : ''}`}>
-                  <input
-                    type="checkbox"
-                    checked={settings.targets.includes(r.id)}
-                    onChange={() => toggleTarget(r.id)}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="route-title">
-                      <Icon name={ROUTE_ICON[r.id] || 'file'} size={13} />
-                      {r.label}
-                      <span className="chip" style={{ marginLeft: 'auto', fontSize: 10 }}>{r.engine}</span>
-                    </div>
-                    <div className="route-blurb">{r.blurb}</div>
-                  </div>
-                </label>
+            <div className="side-section-title" style={{ marginTop: 4 }}><Icon name="zap" size={11} /> 快捷导出（一键，不改上面的设置）</div>
+            <div className="grid-2" style={{ gap: 6 }}>
+              {QUICK_EXPORTS.map((q) => (
+                <button
+                  key={q.id}
+                  className="btn btn-sm quick-export"
+                  title={`${q.hint}\n输出：${q.targets.join(' + ')}`}
+                  disabled={running}
+                  onClick={() => onRender({ targets: q.targets, png: q.png })}
+                >
+                  <Icon name={q.icon} size={12} /> {q.label}
+                </button>
               ))}
             </div>
+
+            <div className="side-section-title">
+              <Icon name="layers" size={11} /> 导出路线
+              <span className="val" style={{ marginLeft: 6 }}>可多选，一次性产出多个文件</span>
+            </div>
+            {ROUTE_GROUPS.map((g) => {
+              const items = g.ids.map((id) => routes.find((r) => r.id === id)).filter(Boolean) as typeof routes;
+              if (!items.length) return null;
+              return (
+                <div key={g.title} className="route-group">
+                  <div className="route-group-head">
+                    <Icon name={g.icon} size={10} /> {g.title}
+                  </div>
+                  <div className="route-grid">
+                    {items.map((r) => {
+                      const on = settings.targets.includes(r.id);
+                      return (
+                        <button
+                          key={r.id}
+                          type="button"
+                          className={`route-chip ${on ? 'active' : ''}`}
+                          title={`${r.label}（${r.engine} 引擎）\n${r.blurb}`}
+                          aria-pressed={on}
+                          onClick={() => toggleTarget(r.id)}
+                        >
+                          <Icon name={on ? 'check' : (ROUTE_ICON[r.id] || 'file')} size={12} />
+                          <span className="route-chip-label">{r.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+            {settings.targets.length > 1 && (
+              <div className="field-hint" style={{ marginTop: 2 }}>
+                已选 {settings.targets.length} 条路线，点「开始渲染」会一次全部产出。
+              </div>
+            )}
 
             {hasPng && (
               <>
@@ -522,16 +608,39 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
             )}
             <div className="side-section-title"><Icon name="package" size={11} /> 产物
               <span style={{ flex: 1 }} />
-              <span className="mono" style={{ fontSize: 10 }}>{shown.length}</span>
+              <div className="seg">
+                <button
+                  className={`seg-btn ${artScope === 'job' ? 'active' : ''}`}
+                  title="只看本次任务产出的文件"
+                  onClick={() => setArtScope('job')}
+                >本次 {jobArtifacts.length}</button>
+                <button
+                  className={`seg-btn ${artScope === 'all' ? 'active' : ''}`}
+                  title="本次 + 服务端产物目录里的历史文件（刷新页面后也能找到）"
+                  onClick={() => setArtScope('all')}
+                >全部 {shown.length}</button>
+              </div>
             </div>
-            {!shown.length && <div className="empty-note">暂无产物。点下方「开始渲染」。</div>}
-            {shown.map((a) => (
+            {!visibleArtifacts.length && (
+              <div className="empty-note">
+                {artScope === 'job'
+                  ? '本次任务还没有产物。点下方「开始渲染」。'
+                  : '产物目录是空的。渲染一次就会出现在这里。'}
+              </div>
+            )}
+            {visibleArtifacts.map((a) => (
               <div className="artifact" key={a.rel}>
-                <div className="artifact-thumb">
+                <button
+                  type="button"
+                  className="artifact-thumb"
+                  title={`点击放大预览\n${a.file}`}
+                  onClick={() => setPreviewArt(a)}
+                >
                   {a.ext === 'png'
-                    ? <img src={api.fileUrl(a.rel)} alt={a.name} />
+                    ? <img src={api.fileUrl(a.rel)} alt={a.name} loading="lazy" />
                     : <Icon name={a.ext === 'pdf' ? 'file' : 'code'} size={18} />}
-                </div>
+                  <span className="artifact-zoom"><Icon name="search" size={10} /></span>
+                </button>
                 <div className="artifact-meta">
                   <div className="artifact-name" title={a.file}>{a.name}</div>
                   <div className="artifact-sub">
@@ -540,13 +649,16 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
                   {a.tool && <div className="artifact-sub">引擎 {a.toolLabel || a.tool}{a.quality === 'low' ? ' ⚠ 降级' : ''}</div>}
                   <div className="row" style={{ gap: 4, marginTop: 5 }}>
                     <a className="btn btn-sm btn-primary" href={api.fileUrl(a.rel, true)} download={a.name}>下载</a>
-                    <a className="btn btn-sm btn-ghost" href={api.fileUrl(a.rel)} target="_blank" rel="noreferrer">打开</a>
-                    <button className="btn btn-sm btn-ghost" title="复制服务器路径"
+                    <button className="btn btn-sm btn-ghost" title="在页面内预览"
+                      onClick={() => setPreviewArt(a)}>
+                      <Icon name="eye" size={11} /> 预览
+                    </button>
+                    <button className="btn btn-sm btn-ghost" title="复制服务器上的完整路径"
                       onClick={() => { navigator.clipboard?.writeText(a.file); onToast('ok', '已复制路径', a.file); }}>
                       <Icon name="copy" size={11} />
                     </button>
                     <span style={{ flex: 1 }} />
-                    <button className="btn btn-sm btn-ghost" title="据此新建文档"
+                    <button className="btn btn-sm btn-ghost" title="用当前内容新建一个文档"
                       onClick={() => { addDoc(a.name, activeDoc?.content || ''); pushToast('info', '已据当前内容新建文档'); }}>
                       <Icon name="plus" size={11} />
                     </button>
@@ -557,6 +669,54 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
           </>
         )}
       </div>
+
+      {/* 产物预览：页内放大看，省掉"下载了才知道导成什么样" */}
+      {previewArt && (
+        <div
+          className="lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`产物预览：${previewArt.name}`}
+          onClick={() => setPreviewArt(null)}
+        >
+          <div className="lightbox-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="lightbox-head">
+              <Icon name={previewArt.ext === 'png' ? 'image' : previewArt.ext === 'pdf' ? 'file' : 'code'} size={12} />
+              <span className="lightbox-title">{previewArt.name}</span>
+              <span className="chip">
+                {previewArt.width ? `${previewArt.width}×${previewArt.height}` : previewArt.ext.toUpperCase()}
+                {previewArt.dpi ? ` · ${previewArt.dpi} DPI` : ''} · {formatBytes(previewArt.bytes)}
+              </span>
+              <span style={{ flex: 1 }} />
+              <button
+                className="btn btn-sm btn-ghost"
+                title="复制服务器上的完整路径"
+                onClick={() => { navigator.clipboard?.writeText(previewArt.file); onToast('ok', '已复制路径', previewArt.file); }}
+              >
+                <Icon name="copy" size={11} /> 复制路径
+              </button>
+              <a className="btn btn-sm btn-primary" href={api.fileUrl(previewArt.rel, true)} download={previewArt.name}>
+                <Icon name="download" size={11} /> 下载
+              </a>
+              <button className="btn btn-sm btn-icon" title="关闭（Esc）" onClick={() => setPreviewArt(null)}>
+                <Icon name="x" size={12} />
+              </button>
+            </div>
+            <div className="lightbox-body">
+              {previewArt.ext === 'png' && <img src={api.fileUrl(previewArt.rel)} alt={previewArt.name} />}
+              {previewArt.ext === 'pdf' && <iframe src={api.fileUrl(previewArt.rel)} title={previewArt.name} />}
+              {previewArt.ext !== 'png' && previewArt.ext !== 'pdf' && (
+                <div className="lightbox-text">
+                  <p>{previewArt.ext.toUpperCase()} 无法在页面内直接预览。</p>
+                  <p className="mono">{previewArt.file}</p>
+                  <a className="btn btn-sm" href={api.fileUrl(previewArt.rel)} target="_blank" rel="noreferrer">在新标签页打开</a>
+                </div>
+              )}
+            </div>
+            <div className="lightbox-foot mono">{previewArt.file}</div>
+          </div>
+        </div>
+      )}
 
       <div className="drawer-foot">
         {running && (
@@ -580,7 +740,12 @@ export function ExportDrawer({ meta, job, busy, running, onRender, onCancel, onR
           </button>
         )}
         <div className="row">
-          <button className="btn btn-primary" style={{ flex: 1 }} disabled={busy && !running} onClick={busy ? onCancel : onRender}>
+          <button
+            className="btn btn-primary"
+            style={{ flex: 1 }}
+            disabled={busy && !running}
+            onClick={busy ? onCancel : () => onRender()}
+          >
             <Icon name={busy ? 'x' : 'download'} size={13} />
             {busy ? '取消渲染' : `开始渲染 · ${settings.targets.length} 个产物`}
           </button>

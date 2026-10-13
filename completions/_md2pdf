@@ -3,7 +3,7 @@
 # 启用方式（二选一）：
 #   1. ./install.sh --with-completion
 #   2. 在 ~/.zshrc 手动加入：
-#        fpath=("/Users/fubin/task/C题/scripts/completions" $fpath)
+#        fpath=("/Users/fubin/scripts/completions" $fpath)
 #        autoload -Uz compinit && compinit
 
 _md2pdf() {
